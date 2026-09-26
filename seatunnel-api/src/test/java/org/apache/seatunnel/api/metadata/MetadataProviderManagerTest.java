@@ -20,6 +20,7 @@ package org.apache.seatunnel.api.metadata;
 import org.apache.seatunnel.shade.com.typesafe.config.Config;
 import org.apache.seatunnel.shade.com.typesafe.config.ConfigFactory;
 
+import org.apache.seatunnel.api.configuration.util.ConfigMapPathUtils;
 import org.apache.seatunnel.api.metadata.exception.MetadataProviderException;
 import org.apache.seatunnel.api.table.catalog.PhysicalColumn;
 import org.apache.seatunnel.api.table.catalog.TableSchema;
@@ -128,6 +129,63 @@ public class MetadataProviderManagerTest {
         assertEquals("root", sink3.getString("user"));
         assertEquals("123456", sink3.getString("password"));
         assertEquals("insert into sink_table4 (id, name) values (?, ?)", sink3.getString("query"));
+    }
+
+    @Test
+    public void testResolveDataSourceConfigsPreservesRegexKeysWithoutDatasourceId() {
+        assertRegexKeysSurviveMetadataResolution(false);
+    }
+
+    @Test
+    public void testResolveDataSourceConfigsPreservesRegexKeysWithDatasourceId() {
+        assertRegexKeysSurviveMetadataResolution(true);
+    }
+
+    private void assertRegexKeysSurviveMetadataResolution(boolean withDatasourceId) {
+        registerProvider(new MockTestMetadataProvider());
+        MetadataConfig metaDataConfig = new MetadataConfig();
+        metaDataConfig.setEnabled(true);
+        metaDataConfig.setKind(TEST_PROVIDER_KIND);
+        metaDataConfig.getProperties().put("provider:label", "literal");
+
+        Map<String, Object> fields = new HashMap<>();
+        fields.put("^t_nova_.*$", "string");
+        fields.put("a:b", "long");
+        Map<String, Object> schema = new HashMap<>();
+        schema.put("fields", fields);
+        Map<String, Object> source = new HashMap<>();
+        source.put("plugin_name", "Jdbc");
+        source.put("schema", schema);
+        if (withDatasourceId) {
+            source.put("metadata_datasource_id", "ds-123");
+        }
+        Map<String, Object> job = new HashMap<>();
+        job.put("source", Arrays.asList(source));
+        job.put("sink", Arrays.asList());
+        Config jobConfig = ConfigFactory.parseMap(ConfigMapPathUtils.quoteInvalidPathKeys(job));
+
+        Config resolved =
+                MetadataProviderManager.resolveDataSourceConfigs(jobConfig, metaDataConfig);
+        Map<String, Object> actualFields =
+                resolved.getConfigList("source")
+                        .get(0)
+                        .getConfig("schema")
+                        .getConfig("fields")
+                        .root()
+                        .unwrapped();
+        assertEquals(fields, actualFields);
+    }
+
+    @Test
+    public void testResolveTableSchemaAcceptsLiteralProviderPropertyKey() {
+        registerProvider(new MockTestMetadataProvider());
+        MetadataConfig metaDataConfig = new MetadataConfig();
+        metaDataConfig.setEnabled(true);
+        metaDataConfig.setKind(TEST_PROVIDER_KIND);
+        metaDataConfig.getProperties().put("provider:label", "literal");
+
+        assertTrue(
+                MetadataProviderManager.resolveTableSchema("table-1", metaDataConfig).isPresent());
     }
 
     @Test
