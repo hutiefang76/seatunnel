@@ -29,7 +29,6 @@ import org.apache.seatunnel.api.table.catalog.TablePath;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.config.JdbcSourceConfig;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.state.JdbcSourceState;
-import org.apache.seatunnel.connectors.seatunnel.jdbc.utils.JdbcCatalogUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -62,11 +61,7 @@ public class JdbcSource
                     e);
         }
         this.jdbcSourceConfig = jdbcSourceConfig;
-        this.jdbcSourceTables =
-                JdbcCatalogUtils.getTables(
-                        jdbcSourceConfig.getJdbcConnectionConfig(),
-                        jdbcSourceConfig.getTableConfigList(),
-                        jdbcSourceConfig.getMultiTableFailurePolicy());
+        this.jdbcSourceTables = DuckLakeSourceSnapshot.loadTables(jdbcSourceConfig);
     }
 
     @Override

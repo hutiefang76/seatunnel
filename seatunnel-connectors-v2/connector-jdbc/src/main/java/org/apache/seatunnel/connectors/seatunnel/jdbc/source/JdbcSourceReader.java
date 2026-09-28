@@ -41,6 +41,7 @@ public class JdbcSourceReader implements SourceReader<SeaTunnelRow, JdbcSourceSp
 
     private final Context context;
     private final JdbcInputFormat inputFormat;
+    private final Map<TablePath, CatalogTable> tables;
     private final Deque<JdbcSourceSplit> splits = new ConcurrentLinkedDeque<>();
     private volatile boolean noMoreSplit;
     private final AtomicInteger assignedSplitCount = new AtomicInteger();
@@ -48,6 +49,7 @@ public class JdbcSourceReader implements SourceReader<SeaTunnelRow, JdbcSourceSp
 
     public JdbcSourceReader(
             Context context, JdbcSourceConfig config, Map<TablePath, CatalogTable> tables) {
+        this.tables = tables;
         this.inputFormat = new JdbcInputFormat(config, tables);
         this.context = context;
     }
@@ -101,6 +103,18 @@ public class JdbcSourceReader implements SourceReader<SeaTunnelRow, JdbcSourceSp
 
     @Override
     public void addSplits(List<JdbcSourceSplit> splits) {
+        for (JdbcSourceSplit split : splits) {
+            if (split.getSnapshotRowType() != null
+                    && (tables.get(split.getTablePath()) == null
+                            || !split.getSnapshotRowType()
+                                    .equals(
+                                            tables.get(split.getTablePath())
+                                                    .getSeaTunnelRowType()))) {
+                throw new IllegalArgumentException(
+                        "DuckLake checkpoint schema differs from reader schema for "
+                                + split.getTablePath());
+            }
+        }
         this.splits.addAll(splits);
         this.assignedSplitCount.addAndGet(splits.size());
     }

@@ -332,6 +332,16 @@ public class JdbcPostgresIT extends TestSuiteBase implements TestResource {
     }
 
     @TestTemplate
+    public void testDuckLakeSnapshotRejectsPostgres(TestContainer container) throws Exception {
+        Container.ExecResult result =
+                container.executeJob("/jdbc_postgres_ducklake_snapshot_rejected.conf");
+        Assertions.assertNotEquals(0, result.getExitCode());
+        Assertions.assertTrue(
+                (result.getStdout() + result.getStderr())
+                        .contains("ducklake_snapshot_auto requires the DuckDB dialect"));
+    }
+
+    @TestTemplate
     public void testAutoGenerateSQL(TestContainer container)
             throws IOException, InterruptedException {
         for (String CONFIG_FILE : PG_CONFIG_FILE_LIST) {

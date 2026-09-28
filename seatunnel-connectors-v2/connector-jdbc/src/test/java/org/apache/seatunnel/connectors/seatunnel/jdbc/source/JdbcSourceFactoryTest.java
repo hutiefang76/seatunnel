@@ -48,6 +48,43 @@ class JdbcSourceFactoryTest {
     }
 
     @Test
+    void testDuckLakeSnapshotRejectsNonDuckDBDialect() {
+        Map<String, Object> cfg = baseConfig();
+        cfg.put("table_path", "test.users");
+        cfg.put("ducklake_snapshot_auto", true);
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        factory.createSource(
+                                        new TableSourceFactoryContext(
+                                                ReadonlyConfig.fromMap(cfg),
+                                                getClass().getClassLoader()))
+                                .createSource());
+    }
+
+    @Test
+    void testDuckLakeSnapshotRejectsCustomQueryAndRegexBeforeConnecting() {
+        for (String key : new String[] {"query", "use_regex"}) {
+            Map<String, Object> cfg = new HashMap<>();
+            cfg.put("url", "jdbc:duckdb:;session_init_sql_file=/does-not-exist.sql");
+            cfg.put("driver", "org.duckdb.DuckDBDriver");
+            cfg.put("table_path", "lake.main.events");
+            cfg.put("ducklake_snapshot_auto", true);
+            cfg.put(key, key.equals("query") ? "SELECT * FROM lake.main.events" : true);
+            IllegalArgumentException error =
+                    Assertions.assertThrows(
+                            IllegalArgumentException.class,
+                            () ->
+                                    factory.createSource(
+                                                    new TableSourceFactoryContext(
+                                                            ReadonlyConfig.fromMap(cfg),
+                                                            getClass().getClassLoader()))
+                                            .createSource());
+            Assertions.assertTrue(error.getMessage().contains("literal"));
+        }
+    }
+
+    @Test
     void testValidConfigWithTablePath() {
         Map<String, Object> cfg = baseConfig();
         cfg.put("table_path", "test.users");

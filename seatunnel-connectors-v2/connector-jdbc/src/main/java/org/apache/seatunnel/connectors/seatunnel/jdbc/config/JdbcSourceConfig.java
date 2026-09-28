@@ -39,6 +39,7 @@ public class JdbcSourceConfig implements Serializable {
     private String whereConditionClause;
     public String compatibleMode;
     private int fetchSize;
+    private boolean duckLakeSnapshotAuto;
 
     private boolean useDynamicSplitter;
     private int splitSize;
@@ -68,6 +69,7 @@ public class JdbcSourceConfig implements Serializable {
         builder.jdbcConnectionConfig(JdbcConnectionConfig.of(config));
         builder.tableConfigList(JdbcSourceTableConfig.of(config));
         builder.fetchSize(config.get(JdbcSourceOptions.FETCH_SIZE));
+        builder.duckLakeSnapshotAuto(config.get(JdbcSourceOptions.DUCKLAKE_SNAPSHOT_AUTO));
         config.getOptional(JdbcSourceOptions.COMPATIBLE_MODE).ifPresent(builder::compatibleMode);
 
         boolean isOldVersion =

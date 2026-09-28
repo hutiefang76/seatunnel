@@ -21,21 +21,31 @@ import org.apache.seatunnel.api.configuration.ReadonlyConfig;
 import org.apache.seatunnel.api.sink.DataSaveMode;
 import org.apache.seatunnel.api.sink.SaveModeHandler;
 import org.apache.seatunnel.api.sink.SchemaSaveMode;
+import org.apache.seatunnel.api.source.SeaTunnelSource;
+import org.apache.seatunnel.api.source.SourceReader;
+import org.apache.seatunnel.api.source.SourceSplit;
+import org.apache.seatunnel.api.source.SourceSplitEnumerator;
 import org.apache.seatunnel.api.table.catalog.CatalogTable;
 import org.apache.seatunnel.api.table.catalog.PhysicalColumn;
 import org.apache.seatunnel.api.table.catalog.TableIdentifier;
 import org.apache.seatunnel.api.table.catalog.TablePath;
 import org.apache.seatunnel.api.table.catalog.TableSchema;
 import org.apache.seatunnel.api.table.catalog.exception.CatalogException;
+import org.apache.seatunnel.api.table.connector.TableSource;
 import org.apache.seatunnel.api.table.factory.TableSinkFactoryContext;
+import org.apache.seatunnel.api.table.factory.TableSourceFactoryContext;
 import org.apache.seatunnel.api.table.type.BasicType;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.common.utils.JdbcUrlUtil;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.catalog.duckdb.DuckDBCatalog;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.catalog.duckdb.DuckDBURLParser;
+import org.apache.seatunnel.connectors.seatunnel.jdbc.config.JdbcSourceConfig;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.sink.JdbcSink;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.sink.JdbcSinkFactory;
+import org.apache.seatunnel.connectors.seatunnel.jdbc.source.JdbcSource;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.source.JdbcSourceFactory;
+import org.apache.seatunnel.connectors.seatunnel.jdbc.source.JdbcSourceSplit;
+import org.apache.seatunnel.connectors.seatunnel.jdbc.state.JdbcSourceState;
 import org.apache.seatunnel.connectors.seatunnel.sink.SinkFlowTestUtils;
 import org.apache.seatunnel.connectors.seatunnel.source.SourceFlowTestUtils;
 
@@ -47,10 +57,16 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Mockito;
 
 import lombok.SneakyThrows;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -59,12 +75,14 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 public class DuckDBSourceAndSinkTest {
@@ -333,6 +351,160 @@ public class DuckDBSourceAndSinkTest {
                     !pinned,
                     rows.stream().anyMatch(row -> Integer.valueOf(99).equals(row.getField(0))));
         }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testAutomaticDuckLakeSnapshotAndPendingTableRestore() throws Exception {
+        Assumptions.assumeTrue(
+                System.getProperty("ducklake.extension") != null
+                        && System.getProperty("sqlite.scanner.extension") != null);
+        Path init = tempDir.resolve("automatic-snapshot.sql");
+        String sql =
+                "/* DUCKDB_CONNECTION_INIT_BELOW_MARKER */\nLOAD '"
+                        + System.getProperty("ducklake.extension").replace("'", "''")
+                        + "';\nLOAD '"
+                        + System.getProperty("sqlite.scanner.extension").replace("'", "''")
+                        + "';\nATTACH IF NOT EXISTS 'ducklake:sqlite:"
+                        + tempDir.resolve("automatic.sqlite")
+                        + "' AS lake (DATA_PATH '"
+                        + tempDir.resolve("automatic-data")
+                        + "');\n";
+        Files.write(init, sql.getBytes(StandardCharsets.UTF_8));
+        String url = "jdbc:duckdb:;session_init_sql_file=" + init;
+        try (Connection c = new DuckDBDriver().connect(url, new Properties());
+                Statement statement = c.createStatement()) {
+            statement.execute("CREATE TABLE lake.main.events (id INTEGER, val VARCHAR)");
+            statement.execute(
+                    "INSERT INTO lake.main.events SELECT i, 'v-' || i FROM range(12) t(i)");
+            statement.execute("CREATE TABLE lake.main.other_events (id INTEGER, val VARCHAR)");
+            statement.execute(
+                    "INSERT INTO lake.main.other_events SELECT i::INTEGER + 100, 'other' FROM range(8) t(i)");
+        }
+        Map<String, Object> options = new HashMap<>();
+        options.put("url", url);
+        options.put("driver", "org.duckdb.DuckDBDriver");
+        Map<String, Object> firstSelection = new HashMap<>();
+        firstSelection.put("table_path", "lake.main.events");
+        firstSelection.put("partition_column", "id");
+        Map<String, Object> secondSelection = new HashMap<>();
+        secondSelection.put("table_path", "LAKE.main.other_events");
+        secondSelection.put("partition_column", "id");
+        options.put("table_list", Arrays.asList(firstSelection, secondSelection));
+        options.put("split.size", 3);
+        options.put("ducklake_snapshot_auto", true);
+        ReadonlyConfig readonly = ReadonlyConfig.fromMap(options);
+        Map<String, Object> liveOptions = new HashMap<>(options);
+        liveOptions.remove("ducklake_snapshot_auto");
+        JdbcSource liveSource =
+                new JdbcSource(JdbcSourceConfig.of(ReadonlyConfig.fromMap(liveOptions)));
+        JdbcSource source = new JdbcSource(JdbcSourceConfig.of(readonly));
+        SourceSplitEnumerator.Context context = Mockito.mock(SourceSplitEnumerator.Context.class);
+        Mockito.when(context.currentParallelism()).thenReturn(3);
+        Mockito.when(context.registeredReaders()).thenReturn(Collections.emptySet());
+        SourceSplitEnumerator enumerator = source.createEnumerator(context);
+        JdbcSourceState checkpoint = (JdbcSourceState) enumerator.snapshotState(1);
+        enumerator.close();
+        Assertions.assertEquals(2, checkpoint.getPendingTables().size());
+        Assertions.assertNotNull(checkpoint.getSnapshotTables());
+        String pinnedQuery = checkpoint.getSnapshotTables().values().iterator().next().getQuery();
+        Assertions.assertTrue(pinnedQuery.contains("AT (VERSION =>"));
+        Assertions.assertEquals(
+                1,
+                checkpoint.getSnapshotTables().values().stream()
+                        .map(
+                                table ->
+                                        table.getQuery()
+                                                .substring(
+                                                        table.getQuery()
+                                                                .indexOf(" AT (VERSION =>")))
+                        .distinct()
+                        .count(),
+                "Tables in one catalog must share a version");
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
+            output.writeObject(checkpoint);
+        }
+        final JdbcSourceState restoredCheckpoint;
+        try (ObjectInputStream input =
+                new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            restoredCheckpoint = (JdbcSourceState) input.readObject();
+        }
+        Assertions.assertEquals(
+                checkpoint.getPendingTables(), restoredCheckpoint.getPendingTables());
+        Assertions.assertEquals(
+                checkpoint.getSnapshotTables().keySet(),
+                restoredCheckpoint.getSnapshotTables().keySet());
+        for (TablePath path : checkpoint.getSnapshotTables().keySet()) {
+            Assertions.assertEquals(
+                    checkpoint.getSnapshotTables().get(path).getQuery(),
+                    restoredCheckpoint.getSnapshotTables().get(path).getQuery());
+            Assertions.assertEquals(
+                    checkpoint
+                            .getSnapshotTables()
+                            .get(path)
+                            .getCatalogTable()
+                            .getSeaTunnelRowType(),
+                    restoredCheckpoint
+                            .getSnapshotTables()
+                            .get(path)
+                            .getCatalogTable()
+                            .getSeaTunnelRowType());
+        }
+        try (Connection c = new DuckDBDriver().connect(url, new Properties());
+                Statement statement = c.createStatement()) {
+            statement.execute("DELETE FROM lake.main.events WHERE id < 6");
+            statement.execute("INSERT INTO lake.main.events VALUES (99, 'new')");
+            statement.execute(
+                    "ALTER TABLE lake.main.events ADD COLUMN later_column INTEGER DEFAULT 42");
+        }
+        SourceSplitEnumerator restored = source.restoreEnumerator(context, restoredCheckpoint);
+        restored.run();
+        JdbcSourceState generated = (JdbcSourceState) restored.snapshotState(2);
+        restored.close();
+        java.util.List<JdbcSourceSplit> splits =
+                generated.getPendingSplits().values().stream()
+                        .flatMap(List::stream)
+                        .collect(Collectors.toList());
+        Assertions.assertTrue(splits.size() > 1, "Parallel split generation must remain active");
+        for (JdbcSourceSplit split : splits) {
+            Assertions.assertTrue(split.getSplitQuery().contains("AT (VERSION =>"));
+            Assertions.assertNotNull(split.getSnapshotRowType());
+        }
+        JdbcSourceFactory frozenFactory = frozenSourceFactory(source);
+        List<SeaTunnelRow> rows =
+                SourceFlowTestUtils.runParallelSubtasksBatchWithCheckpointDisabled(
+                        readonly, frozenFactory, 3);
+        Assertions.assertEquals(20, rows.size());
+        Assertions.assertEquals(20, rows.stream().map(row -> row.getField(0)).distinct().count());
+        Assertions.assertTrue(rows.stream().allMatch(row -> row.getFields().length == 2));
+        Assertions.assertFalse(
+                rows.stream().anyMatch(row -> Integer.valueOf(99).equals(row.getField(0))));
+        List<SeaTunnelRow> liveRows =
+                SourceFlowTestUtils.runParallelSubtasksBatchWithCheckpointDisabled(
+                        ReadonlyConfig.fromMap(liveOptions), frozenSourceFactory(liveSource), 3);
+        Assertions.assertEquals(15, liveRows.size());
+        Assertions.assertTrue(
+                liveRows.stream().anyMatch(row -> Integer.valueOf(99).equals(row.getField(0))));
+        JdbcSource changedSource = new JdbcSource(JdbcSourceConfig.of(readonly));
+        Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> changedSource.restoreEnumerator(context, restoredCheckpoint));
+        SourceReader changedReader =
+                changedSource.createReader(Mockito.mock(SourceReader.Context.class));
+        Assertions.assertThrows(
+                IllegalArgumentException.class, () -> changedReader.addSplits(splits));
+    }
+
+    @SuppressWarnings("unchecked")
+    private JdbcSourceFactory frozenSourceFactory(JdbcSource source) {
+        return new JdbcSourceFactory() {
+            @Override
+            public <T, SplitT extends SourceSplit, StateT extends Serializable>
+                    TableSource<T, SplitT, StateT> createSource(TableSourceFactoryContext ignored) {
+                return () -> (SeaTunnelSource<T, SplitT, StateT>) source;
+            }
+        };
     }
 
     private void runAttachedCatalogSourceAndSink(boolean duckLake) throws Exception {

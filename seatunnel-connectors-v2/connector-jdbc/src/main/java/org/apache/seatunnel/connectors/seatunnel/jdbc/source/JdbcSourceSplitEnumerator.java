@@ -47,6 +47,7 @@ public class JdbcSourceSplitEnumerator
     private final Map<Integer, List<JdbcSourceSplit>> pendingSplits;
     private final ChunkSplitter splitter;
     private final Context<JdbcSourceSplit> context;
+    private final boolean snapshotPinned;
     private final Object stateLock = new Object();
 
     public JdbcSourceSplitEnumerator(
@@ -55,7 +56,32 @@ public class JdbcSourceSplitEnumerator
             Map<TablePath, JdbcSourceTable> tables,
             JdbcSourceState sourceState) {
         this.context = context;
-        this.tables = tables;
+        this.snapshotPinned =
+                jdbcSourceConfig.isDuckLakeSnapshotAuto()
+                        || (sourceState != null && sourceState.getSnapshotTables() != null);
+        if (sourceState != null
+                && jdbcSourceConfig.isDuckLakeSnapshotAuto()
+                && sourceState.getSnapshotTables() == null) {
+            throw new IllegalArgumentException(
+                    "Cannot enable ducklake_snapshot_auto when restoring a checkpoint without a pinned snapshot; start a new job instead.");
+        }
+        this.tables =
+                sourceState != null && sourceState.getSnapshotTables() != null
+                        ? new HashMap<>(sourceState.getSnapshotTables())
+                        : tables;
+        if (snapshotPinned) {
+            for (Map.Entry<TablePath, JdbcSourceTable> entry : this.tables.entrySet()) {
+                JdbcSourceTable current = tables.get(entry.getKey());
+                if (current == null
+                        || !current.getCatalogTable()
+                                .getSeaTunnelRowType()
+                                .equals(entry.getValue().getCatalogTable().getSeaTunnelRowType())) {
+                    throw new IllegalArgumentException(
+                            "DuckLake checkpoint schema differs from submitted source schema for "
+                                    + entry.getKey());
+                }
+            }
+        }
         this.splitter = ChunkSplitter.create(jdbcSourceConfig);
         if (sourceState == null) {
             this.pendingTables = new ConcurrentLinkedQueue<>(tables.keySet());
@@ -82,6 +108,12 @@ public class JdbcSourceSplitEnumerator
                 Collection<JdbcSourceSplit> splits = splitter.generateSplits(tables.get(tablePath));
                 LOG.info("Split table {} into {} splits.", tablePath, splits.size());
 
+                if (snapshotPinned) {
+                    for (JdbcSourceSplit split : splits) {
+                        split.setSnapshotRowType(
+                                tables.get(tablePath).getCatalogTable().getSeaTunnelRowType());
+                    }
+                }
                 addPendingSplit(splits);
             }
 
@@ -140,7 +172,10 @@ public class JdbcSourceSplitEnumerator
     @Override
     public JdbcSourceState snapshotState(long checkpointId) throws Exception {
         synchronized (stateLock) {
-            return new JdbcSourceState(new ArrayList(pendingTables), new HashMap<>(pendingSplits));
+            return new JdbcSourceState(
+                    new ArrayList(pendingTables),
+                    new HashMap<>(pendingSplits),
+                    snapshotPinned ? new HashMap<>(tables) : null);
         }
     }
 

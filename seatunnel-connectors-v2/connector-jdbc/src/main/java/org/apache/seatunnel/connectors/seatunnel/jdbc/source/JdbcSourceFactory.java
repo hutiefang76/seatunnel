@@ -109,7 +109,8 @@ public class JdbcSourceFactory implements TableSourceFactory, SupportSourceDryRu
                         JdbcSourceOptions.DECIMAL_TYPE_NARROWING,
                         JdbcSourceOptions.INT_TYPE_NARROWING,
                         JdbcSourceOptions.DIALECT,
-                        JdbcSourceOptions.ENABLE_CONCURRENT_READ)
+                        JdbcSourceOptions.ENABLE_CONCURRENT_READ,
+                        JdbcSourceOptions.DUCKLAKE_SNAPSHOT_AUTO)
                 .build();
     }
 
@@ -127,6 +128,9 @@ public class JdbcSourceFactory implements TableSourceFactory, SupportSourceDryRu
     public List<CatalogTable> inferSchemaForDryRun(TableSourceFactoryContext context)
             throws Exception {
         JdbcSourceConfig config = JdbcSourceConfig.of(context.getOptions());
+        if (config.isDuckLakeSnapshotAuto()) {
+            return new JdbcSource(config).getProducedCatalogTables();
+        }
         return JdbcCatalogUtils.getTables(
                         config.getJdbcConnectionConfig(),
                         config.getTableConfigList(),

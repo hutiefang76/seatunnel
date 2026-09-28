@@ -27,6 +27,13 @@ import java.util.List;
 @SuppressWarnings("checkstyle:MagicNumber")
 public class JdbcSourceOptions extends JdbcCommonOptions {
 
+    public static final Option<Boolean> DUCKLAKE_SNAPSHOT_AUTO =
+            Options.key("ducklake_snapshot_auto")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Select one DuckLake snapshot per catalog before schema discovery and retain it through split recovery. Requires literal table paths, without query or use_regex.");
+
     public static final Option<String> TABLE_PATH =
             Options.key("table_path")
                     .stringType()

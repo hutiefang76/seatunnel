@@ -325,4 +325,21 @@ AS lake (METADATA_SCHEMA 'lake_meta', SNAPSHOT_VERSION 2);
 
 ## Changelog
 
+### 自动固定 DuckLake Source 快照
+
+`ducklake_snapshot_auto` 是可选布尔参数，默认 `false`。使用 DuckDB dialect 和明确的 `catalog.schema.table` 时，启用后会在发现列结构前为每个 catalog 选择一次快照。生成的查询在列结构发现、分片边界查询和实际读取中使用同一版本。尚未分片的表查询及结构会写入 checkpoint；恢复分片保留原版本，并在输出记录前拒绝与 reader 不兼容的列结构。作业及恢复期间必须保留快照；版本不可用时作业失败，不回退到最新数据。
+
+使用 `table_path` 或 `table_list`，不能同时配置 `query` 或 `use_regex`。需要并行分片时明确指定 `partition_column`，与其他 DuckLake 表读取相同。初始化脚本和凭据不会被改写或自动分发。不同 catalog 各自固定快照，不提供跨 catalog 的原子一致性。这是有界快照读取，不是变更订阅或 Sink 的 exactly-once 协议。从没有快照状态的旧 checkpoint 恢复时不能启用本参数，应启动新作业。
+
+```hocon
+Jdbc {
+  url = "jdbc:duckdb:;session_init_sql_file=/opt/seatunnel/ducklake-init.sql"
+  driver = "org.duckdb.DuckDBDriver"
+  table_path = "lake.main.events"
+  partition_column = "id"
+  split.size = 10000
+  ducklake_snapshot_auto = true
+}
+```
+
 <ChangeLog />

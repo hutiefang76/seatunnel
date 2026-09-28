@@ -327,4 +327,21 @@ Catalog discovery with `table_pattern` or a regular-expression `table_path` sear
 
 ## Change Log
 
+### Automatically pin a DuckLake Source snapshot
+
+`ducklake_snapshot_auto` is an optional boolean, default `false`. With the DuckDB dialect and literal `catalog.schema.table` selections, enabling it selects one DuckLake snapshot per catalog before schema discovery. Generated queries use that version for schema discovery, split bounds and reader queries. Pending table queries and schemas are checkpointed; restored splits retain their version and reject incompatible reader schemas before records are emitted. Retain the snapshot throughout the job and recovery: an unavailable version fails instead of falling back to current data.
+
+Use `table_path` or `table_list`, without `query` or `use_regex`. Set `partition_column` explicitly for parallel splitting, as for other DuckLake reads. User initialization scripts and credentials are not rewritten or distributed. Different catalogs have independent snapshots, without cross-catalog atomicity. This is bounded snapshot reading, not a change feed or exactly-once Sink delivery. Enabling it while restoring an older checkpoint without snapshot state is rejected; start a new job instead.
+
+```hocon
+Jdbc {
+  url = "jdbc:duckdb:;session_init_sql_file=/opt/seatunnel/ducklake-init.sql"
+  driver = "org.duckdb.DuckDBDriver"
+  table_path = "lake.main.events"
+  partition_column = "id"
+  split.size = 10000
+  ducklake_snapshot_auto = true
+}
+```
+
 <ChangeLog />

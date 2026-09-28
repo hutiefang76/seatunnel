@@ -45,6 +45,34 @@ import java.util.concurrent.atomic.AtomicInteger;
 class JdbcSourceSplitEnumeratorTest {
 
     @Test
+    void testEnablingSnapshotOnLegacyCheckpointIsRejected() {
+        JdbcSourceConfig config =
+                JdbcSourceConfig.builder()
+                        .duckLakeSnapshotAuto(true)
+                        .jdbcConnectionConfig(
+                                JdbcConnectionConfig.builder()
+                                        .url("jdbc:generic://localhost:0/test")
+                                        .driverName("org.example.Driver")
+                                        .build())
+                        .build();
+        org.apache.seatunnel.connectors.seatunnel.jdbc.state.JdbcSourceState legacy =
+                new org.apache.seatunnel.connectors.seatunnel.jdbc.state.JdbcSourceState(
+                        Collections.emptyList(), Collections.emptyMap());
+        Assertions.assertNull(legacy.getSnapshotTables());
+        IllegalArgumentException error =
+                Assertions.assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                new JdbcSourceSplitEnumerator(
+                                        org.mockito.Mockito.mock(
+                                                SourceSplitEnumerator.Context.class),
+                                        config,
+                                        Collections.emptyMap(),
+                                        legacy));
+        Assertions.assertTrue(error.getMessage().contains("start a new job"));
+    }
+
+    @Test
     void testRunSignalsNoMoreSplitsOnce() throws Exception {
         int parallelism = 1;
         TablePath tablePath = TablePath.of("db", "schema", "table");
@@ -105,6 +133,7 @@ class JdbcSourceSplitEnumeratorTest {
         JdbcSourceSplitEnumerator enumerator =
                 new JdbcSourceSplitEnumerator(context, sourceConfig, tables, null);
 
+        Assertions.assertNull(enumerator.snapshotState(1).getSnapshotTables());
         enumerator.open();
         enumerator.run();
 

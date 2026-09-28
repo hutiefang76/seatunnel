@@ -47,6 +47,18 @@ public class JdbcSourceConfigTest {
         assertEquals(StringSplitStrategy.RANGE, sourceConfig.getStringSplitStrategy());
     }
 
+    @Test
+    public void testDuckLakeSnapshotIsOptIn() {
+        Map<String, Object> options = baseConfig();
+        assertEquals(
+                false,
+                JdbcSourceConfig.of(ReadonlyConfig.fromMap(options)).isDuckLakeSnapshotAuto());
+        options.put("ducklake_snapshot_auto", true);
+        assertEquals(
+                true,
+                JdbcSourceConfig.of(ReadonlyConfig.fromMap(options)).isDuckLakeSnapshotAuto());
+    }
+
     private Map<String, Object> baseConfig() {
         Map<String, Object> configMap = new HashMap<>();
         configMap.put("url", "jdbc:postgresql://localhost:5432/test");

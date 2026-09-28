@@ -19,6 +19,7 @@ package org.apache.seatunnel.connectors.seatunnel.jdbc.state;
 
 import org.apache.seatunnel.api.table.catalog.TablePath;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.source.JdbcSourceSplit;
+import org.apache.seatunnel.connectors.seatunnel.jdbc.source.JdbcSourceTable;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -33,4 +34,10 @@ public class JdbcSourceState implements Serializable {
     private static final long serialVersionUID = -6441009212721284346L;
     private List<TablePath> pendingTables;
     private Map<Integer, List<JdbcSourceSplit>> pendingSplits;
+    private Map<TablePath, JdbcSourceTable> snapshotTables;
+
+    public JdbcSourceState(
+            List<TablePath> pendingTables, Map<Integer, List<JdbcSourceSplit>> pendingSplits) {
+        this(pendingTables, pendingSplits, null);
+    }
 }
