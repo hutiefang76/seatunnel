@@ -1,0 +1,144 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+name: 'Edge agent pinned-source diagnostics'
+
+on:
+  push:
+    branches:
+      - 'frank/edge-agent-diagnostics-20261022'
+
+permissions:
+  contents: read
+
+env:
+  TEST_IN_PR: 'true'
+  TESTCONTAINERS_RYUK_DISABLED: 'true'
+
+jobs:
+  edge-agent-diagnostics:
+    if: github.repository == 'hutiefang76/seatunnel'
+    name: Edge agent diagnostics (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        java: [ '11', '17' ]
+    steps:
+      - name: Check out pinned source
+        uses: actions/checkout@v4
+        with:
+          repository: hutiefang76/seatunnel
+          ref: cb6ae01c05481b1085bc3bc3c3f430d74b909fd2
+          persist-credentials: false
+      - name: Assert source revision and fresh checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = cb6ae01c05481b1085bc3bc3c3f430d74b909fd2
+          test "$(uname -m)" = x86_64
+          test -z "$(find . -path ./.git -prune -o -type d -name target -not -path '*/src/*' -print)"
+          test -z "${RUN_ENGINES+x}"
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: 'temurin'
+      - name: free disk space
+        run: tools/github/free_disk_space.sh
+      - name: Record source and runtime provenance
+        shell: bash
+        env:
+          MAVEN_OPTS: -Xmx4096m
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/edge-diagnostics"
+          {
+            echo "diagnosticWorkflowSHA=${GITHUB_SHA}"
+            echo "sourceCheckoutSHA=$(git rev-parse HEAD)"
+            echo "sourceCheckoutRepository=hutiefang76/seatunnel"
+            echo "matrixJava=${{ matrix.java }}"
+            echo "mavenCache=no-cache-action (upstream restores a Maven cache)"
+            echo "TEST_IN_PR=${TEST_IN_PR} TESTCONTAINERS_RYUK_DISABLED=${TESTCONTAINERS_RYUK_DISABLED} RUN_ENGINES=unset"
+            echo "MAVEN_OPTS=${MAVEN_OPTS}"
+            uname -sm
+            java -version 2>&1
+            ./mvnw -v
+            repository="${HOME}/.m2/repository"
+            echo "mavenLocalRepositoryPresent=$([ -d "$repository" ] && echo true || echo false)"
+            if [ -d "$repository/org/apache/seatunnel" ] &&
+               [ -n "$(find "$repository/org/apache/seatunnel" -name '*SNAPSHOT*' -print -quit)" ]; then
+              echo "::error::Pre-existing SeaTunnel SNAPSHOT dependency found."
+              exit 1
+            fi
+            echo "preExistingSeaTunnelSnapshot=false"
+            docker version --format 'client={{.Client.Version}} server={{.Server.Version}}'
+            docker info --format 'architecture={{.Architecture}} cpus={{.NCPU}} memory={{.MemTotal}}'
+            df -h .
+          } | tee "${RUNNER_TEMP}/edge-diagnostics/provenance.txt"
+      - name: Run edge agent integration test
+        shell: bash
+        env:
+          MAVEN_OPTS: -Xmx4096m
+        run: |
+          ./mvnw -T 1 -B verify -DskipUT=false -DskipIT=false -D"license.skipAddThirdParty"=true -D"skip.ui"=true --no-snapshot-updates -pl :seatunnel-edge-agent-e2e -am -Pci
+      - name: Count executed edge cases
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PYCOUNT'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          reports = sorted(Path("seatunnel-e2e/seatunnel-edge-agent-e2e/target/failsafe-reports").glob("TEST-*.xml"))
+          cases = [case for report in reports for case in ET.parse(report).getroot().iter("testcase")
+                   if case.get("classname", "") == "org.apache.seatunnel.edge.agent.e2e.EdgeAgentFileToEngineIT"]
+          skipped = sum(case.find("skipped") is not None for case in cases)
+          failed = sum(case.find("failure") is not None for case in cases)
+          errors = sum(case.find("error") is not None for case in cases)
+          executed = len(cases) - skipped
+          verdict = "NOT_VERIFIED" if not executed else ("FAILED" if failed + errors else "EXECUTED")
+          text = (f"edgeFailsafeXmlFiles={len(reports)} cases={len(cases)} executed={executed} "
+                  f"skipped={skipped} failures={failed} errors={errors} evidence={verdict}\n")
+          output = Path(os.environ["RUNNER_TEMP"]) / "edge-diagnostics"
+          output.mkdir(exist_ok=True)
+          (output / "edge-case-counts.txt").write_text(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("Supplementary pinned-source diagnostics; this does not update the PR Build check.\n\n" + text)
+          print(text, end="")
+          if not executed:
+              raise SystemExit("Edge execution unverified: no executed EdgeAgentFileToEngineIT Failsafe cases.")
+          if failed + errors:
+              raise SystemExit("Edge Failsafe XML contains failures or errors.")
+          PYCOUNT
+      - name: Upload XML and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-agent-diagnostics-jdk${{ matrix.java }}-attempt${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/edge-diagnostics/provenance.txt
+            ${{ runner.temp }}/edge-diagnostics/edge-case-counts.txt
+            **/target/surefire-reports/*.xml
+            **/target/failsafe-reports/*.xml
+          retention-days: 7
+          if-no-files-found: warn
