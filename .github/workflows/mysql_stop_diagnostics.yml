@@ -1,0 +1,243 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+name: 'MySQL CDC stop-mode pinned-source diagnostics'
+
+on:
+  push:
+    branches:
+      - 'frank/mysql-stop-diagnostics-20261023'
+
+permissions:
+  contents: read
+
+env:
+  RUN_ENGINES: 'zeta'
+  TEST_IN_PR: 'true'
+  TESTCONTAINERS_RYUK_DISABLED: 'true'
+
+jobs:
+  mysql-cdc-stop-mode-diagnostics:
+    if: github.repository == 'hutiefang76/seatunnel'
+    name: MySQL CDC stop-mode diagnostics (JDK 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out pinned source
+        uses: actions/checkout@v4
+        with:
+          repository: hutiefang76/seatunnel
+          ref: 50c37bd7c4b833898632248ae0a80b17f885481f
+          persist-credentials: false
+      - name: Assert source revision and fresh checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 50c37bd7c4b833898632248ae0a80b17f885481f
+          test "$(uname -m)" = x86_64
+          test -z "$(find . -path ./.git -prune -o -type d -name target -not -path '*/src/*' -print)"
+          test "${RUN_ENGINES}" = zeta
+          echo "SOURCE_CHECKOUT_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+          echo "sourceRevisionPinned=true freshCheckoutNoTargetDirs=true"
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: free disk space
+        run: tools/github/free_disk_space.sh
+      - name: Record source and runtime provenance
+        shell: bash
+        env:
+          MAVEN_OPTS: -Xmx4096m
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/mysql-diagnostics"
+          {
+            echo "diagnosticWorkflowSHA=${GITHUB_SHA}"
+            echo "sourceCheckoutSHA=$(git rev-parse HEAD)"
+            echo "sourceCheckoutRepository=hutiefang76/seatunnel"
+            echo "sourceCheckoutRefLiteral=50c37bd7c4b833898632248ae0a80b17f885481f"
+            echo "testedSourceIsWorkflowHead=false"
+            echo "matrixJava=none jobJava=17 (setup-java temurin)"
+            echo "mavenCache=no-cache-action (no cache restore, no borrowed generated artifacts)"
+            echo "TEST_IN_PR=${TEST_IN_PR} TESTCONTAINERS_RYUK_DISABLED=${TESTCONTAINERS_RYUK_DISABLED} RUN_ENGINES=${RUN_ENGINES}"
+            echo "MAVEN_OPTS=${MAVEN_OPTS}"
+            echo "engineFixtureImageExpected=eclipse-temurin:11-jdk (expected from public source; not a runtime-executed claim)"
+            echo "mysqlFixtureVersionExpected=8.0.43 (expected from public source; not a runtime-executed claim)"
+            echo "testTarget=org.apache.seatunnel.connectors.seatunnel.cdc.mysql.MysqlCDCStopModeSpecificIT"
+            echo "evidenceClass=supplementary pinned-source test evidence; does not update or adopt the PR Build check"
+            uname -sm
+            java -version 2>&1
+            ./mvnw -v
+            repository="${HOME}/.m2/repository"
+            echo "mavenLocalRepositoryPresent=$([ -d "$repository" ] && echo true || echo false)"
+            if [ -d "$repository/org/apache/seatunnel" ] &&
+               [ -n "$(find "$repository/org/apache/seatunnel" -name '*SNAPSHOT*' -print -quit)" ]; then
+              echo "::error::Pre-existing SeaTunnel SNAPSHOT dependency found."
+              exit 1
+            fi
+            echo "preExistingSeaTunnelSnapshot=false"
+            echo "command=single source reactor verify; installOrReleaseBuild=absent"
+            docker version --format 'client={{.Client.Version}} server={{.Server.Version}}'
+            docker info --format 'architecture={{.Architecture}} cpus={{.NCPU}} memory={{.MemTotal}}'
+            df -h .
+          } | tee "${RUNNER_TEMP}/mysql-diagnostics/provenance.txt"
+      - name: Run MySQL CDC stop-mode integration test
+        shell: bash
+        env:
+          MAVEN_OPTS: -Xmx4096m
+        run: |
+          ./mvnw -B -T 1 verify -DskipUT=true -DskipIT=false -D"license.skipAddThirdParty"=true -D"skip.ui"=true --no-snapshot-updates -pl :connector-cdc-mysql-e2e -am -Pci -Dit.test=MysqlCDCStopModeSpecificIT -Dfailsafe.failIfNoSpecifiedTests=false
+      - name: Record fixture container image provenance
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          output="${RUNNER_TEMP}/mysql-diagnostics"
+          mkdir -p "$output"
+          record="${output}/fixture-images.txt"
+          : > "$record"
+          for image in eclipse-temurin:11-jdk mysql:8.0.43; do
+            if docker image inspect "$image" > /dev/null 2>&1; then
+              docker image inspect "$image" \
+                --format "image=$image present=true arch={{.Architecture}} os={{.Os}} id={{.Id}} created={{.Created}}" \
+                >> "$record"
+            else
+              echo "image=$image present=false (not pulled by this run; no extra pull performed)" >> "$record"
+            fi
+          done
+          cat "$record"
+      - name: Count executed MySQL CDC stop-mode cases
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PYCOUNT'
+          import json
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          CLASSNAME = "org.apache.seatunnel.connectors.seatunnel.cdc.mysql.MysqlCDCStopModeSpecificIT"
+          EXPECTED = [
+              "testMysqlCdcStopModeSpecificTerminatesAtStopOffset",
+              "testMysqlCdcStopModeSpecificWithTimestampStartup",
+              "testMysqlCdcInitialStartupWithLatestStop",
+              "testMysqlCdcEarliestStartupWithLatestStop",
+              "testMysqlCdcLatestStartupWithLatestStop",
+              "testMysqlCdcSpecificStartupWithLatestStop",
+              "testMysqlCdcTimestampStartupWithLatestStop",
+          ]
+          REPORT_DIR = Path("seatunnel-e2e/seatunnel-connector-v2-e2e/connector-cdc-mysql-e2e/target/failsafe-reports")
+          reports = sorted(REPORT_DIR.glob("TEST-*.xml"))
+
+          cases = []
+          for report in reports:
+              root = ET.parse(report).getroot()
+              for case in root.iter("testcase"):
+                  if case.get("classname", "") == CLASSNAME:
+                      cases.append(case)
+
+          names = [(case.get("name") or "").split("{", 1)[0] for case in cases]
+          skipped = sum(1 for case in cases if case.find("skipped") is not None)
+          failures = sum(1 for case in cases if case.find("failure") is not None)
+          errors = sum(1 for case in cases if case.find("error") is not None)
+          executed = len(cases) - skipped
+
+          expected_set = set(EXPECTED)
+          actual_set = set(names)
+          missing = sorted(expected_set - actual_set)
+          unexpected = sorted(actual_set - expected_set)
+          duplicates = sorted({name for name in names if names.count(name) > 1})
+          set_matches = (
+              not missing
+              and not unexpected
+              and not duplicates
+              and len(names) == len(EXPECTED)
+              and len(cases) == len(EXPECTED)
+          )
+
+          if not reports or not cases:
+              verdict = "NOT_VERIFIED"
+          elif set_matches and executed == len(EXPECTED) and skipped == 0 and failures == 0 and errors == 0:
+              verdict = "PASSED"
+          else:
+              verdict = "FAILED"
+
+          payload = {
+              "target": CLASSNAME,
+              "evidence": verdict,
+              "failsafeReportDir": str(REPORT_DIR),
+              "failsafeXmlFiles": len(reports),
+              "cases": len(cases),
+              "executed": executed,
+              "skipped": skipped,
+              "failures": failures,
+              "errors": errors,
+              "expectedCaseCount": len(EXPECTED),
+              "expectedMethods": EXPECTED,
+              "executedMethods": sorted(names),
+              "missingMethods": missing,
+              "unexpectedMethods": unexpected,
+              "duplicateMethods": duplicates,
+              "methodSetMatchesExactly": set_matches,
+              "sourceCheckoutSHA": os.environ.get("SOURCE_CHECKOUT_SHA", ""),
+              "diagnosticWorkflowSHA": os.environ.get("GITHUB_SHA", ""),
+          }
+
+          output = Path(os.environ["RUNNER_TEMP"]) / "mysql-diagnostics"
+          output.mkdir(parents=True, exist_ok=True)
+          (output / "mysql-methods.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+          text = (
+              f"target={CLASSNAME} failsafeXmlFiles={len(reports)} cases={len(cases)} "
+              f"executed={executed} skipped={skipped} failures={failures} errors={errors} "
+              f"expected={len(EXPECTED)} methodSetMatchesExactly={set_matches} evidence={verdict}\n"
+              f"executedMethods={','.join(sorted(names)) if names else '<none>'}\n"
+              f"missingMethods={','.join(missing) if missing else '<none>'} "
+              f"unexpectedMethods={','.join(unexpected) if unexpected else '<none>'} "
+              f"duplicateMethods={','.join(duplicates) if duplicates else '<none>'}\n"
+          )
+          (output / "mysql-case-counts.txt").write_text(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(
+                  "Supplementary pinned-source MySQL CDC stop-mode diagnostics; "
+                  "this does not update or adopt the PR Build check.\n\n" + text
+              )
+          print(text, end="")
+
+          if verdict == "NOT_VERIFIED":
+              raise SystemExit("NOT_VERIFIED: no Failsafe XML/testcase for MysqlCDCStopModeSpecificIT.")
+          if verdict != "PASSED":
+              raise SystemExit("FAILED: unexpected MysqlCDCStopModeSpecificIT result set or counts.")
+          PYCOUNT
+      - name: Upload XML and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-cdc-stop-mode-diagnostics-attempt${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/mysql-diagnostics/provenance.txt
+            ${{ runner.temp }}/mysql-diagnostics/mysql-case-counts.txt
+            ${{ runner.temp }}/mysql-diagnostics/mysql-methods.json
+            ${{ runner.temp }}/mysql-diagnostics/fixture-images.txt
+            **/target/failsafe-reports/*.xml
+            **/target/surefire-reports/*.xml
+          retention-days: 7
+          if-no-files-found: warn
