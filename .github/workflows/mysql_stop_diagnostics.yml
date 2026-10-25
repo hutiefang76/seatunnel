@@ -104,7 +104,7 @@ jobs:
         env:
           MAVEN_OPTS: -Xmx4096m
         run: |
-          ./mvnw -B -T 1 verify -DskipUT=true -DskipIT=false -D"license.skipAddThirdParty"=true -D"skip.ui"=true --no-snapshot-updates -pl :connector-cdc-mysql-e2e -am -Pci -Dit.test=MysqlCDCStopModeSpecificIT -Dfailsafe.failIfNoSpecifiedTests=false
+          ./mvnw -B -T 1 verify -DskipUT=true -DskipIT=false -D"license.skipAddThirdParty"=true -D"skip.ui"=true --no-snapshot-updates -pl :connector-cdc-mysql-e2e -am -Pci -Dit.test=MysqlCDCStopModeSpecificIT -DfailIfNoTests=false -Dit.failIfNoSpecifiedTests=false
       - name: Record fixture container image provenance
         if: always()
         shell: bash
