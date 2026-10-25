@@ -58,9 +58,13 @@ jobs:
     name: MySQL CDC stop-mode negative control (JDK 17)
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    env:
-      NC_EVIDENCE_DIR: ${{ runner.temp }}/mysql-negative-control
     steps:
+      - name: Initialize evidence path on the runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${RUNNER_TEMP}"
+          echo "NC_EVIDENCE_DIR=${RUNNER_TEMP}/mysql-negative-control" >> "${GITHUB_ENV}"
       - name: Check out pinned source
         uses: actions/checkout@v4
         with:
