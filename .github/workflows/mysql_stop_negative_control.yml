@@ -1,0 +1,812 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# Fork-only negative control for the MySQL CDC stop-mode ordering fix
+# (source commit 50c37bd7c4b833898632248ae0a80b17f885481f: wait for FINISHED and a zero job
+# exit code before the final bounded sink-value assertion).
+#
+# WHY: the positive evidence for that ordering is already recorded (native Linux AMD64,
+# MySQL 8.0.43, JDK 17, run 40203109932: all seven stop-mode cases executed with zero
+# failures/errors/skips) and is preserved, not rerun here. What is missing is proof that the
+# ordering still DETECTS a lost expected value. This workflow therefore deliberately makes the
+# real MySQL sink drop one value and checks that the unchanged 60-second value assertion fails
+# with a ConditionTimeoutException naming that value.
+#
+# NEVER GOES UPSTREAM: the only trigger is a push to a fork-local branch, and the job itself
+# additionally requires github.repository == 'hutiefang76/seatunnel'. The pinned Apache source
+# commit is checked out unmodified; the fault is injected at RUNTIME into exactly one test file,
+# never committed, and the injected diff is uploaded as evidence only. This is controlled
+# database write loss injected by the test, NOT a claim of a newly observed engine bug.
+
+name: 'MySQL CDC stop-mode negative control (fork-only, real MySQL fault injection)'
+
+on:
+  push:
+    branches:
+      - 'frank/mysql-stop-negative-control-20261026'
+
+permissions:
+  contents: read
+
+env:
+  RUN_ENGINES: 'zeta'
+  TEST_IN_PR: 'true'
+  TESTCONTAINERS_RYUK_DISABLED: 'true'
+  NC_SOURCE_COMMIT: '50c37bd7c4b833898632248ae0a80b17f885481f'
+  NC_TEST_PATH: 'seatunnel-e2e/seatunnel-connector-v2-e2e/connector-cdc-mysql-e2e/src/test/java/org/apache/seatunnel/connectors/seatunnel/cdc/mysql/MysqlCDCStopModeSpecificIT.java'
+  NC_TEST_SHA256: 'f58a2a39e04372c5b095ff74a97d567127beb15a9f62c20a551a9362299d6ff8'
+
+jobs:
+  mysql-cdc-stop-mode-negative-control:
+    if: github.repository == 'hutiefang76/seatunnel'
+    name: MySQL CDC stop-mode negative control (JDK 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NC_EVIDENCE_DIR: ${{ runner.temp }}/mysql-negative-control
+    steps:
+      - name: Check out pinned source
+        uses: actions/checkout@v4
+        with:
+          repository: hutiefang76/seatunnel
+          ref: 50c37bd7c4b833898632248ae0a80b17f885481f
+          persist-credentials: false
+      - name: Assert source revision and fresh checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${NC_SOURCE_COMMIT}"
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          test -z "$(git status --porcelain -uno)"
+          test -z "$(find . -path ./.git -prune -o -type d -name target -not -path '*/src/*' -print)"
+          test "${RUN_ENGINES}" = zeta
+          echo "SOURCE_CHECKOUT_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+          echo "NC_SOURCE_FRESH_CHECKOUT=true" >> "${GITHUB_ENV}"
+          echo "sourceRevisionPinned=true freshCheckoutNoTargetDirs=true cleanWorktree=true"
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: free disk space
+        run: tools/github/free_disk_space.sh
+      - name: Record source and runtime provenance
+        shell: bash
+        env:
+          MAVEN_OPTS: -Xmx4096m
+        run: |
+          set -euo pipefail
+          mkdir -p "${NC_EVIDENCE_DIR}"
+          {
+            echo "negativeControlWorkflowSHA=${GITHUB_SHA}"
+            echo "negativeControlWorkflowRef=${GITHUB_REF}"
+            echo "sourceCheckoutSHA=$(git rev-parse HEAD)"
+            echo "sourceCheckoutRepository=hutiefang76/seatunnel"
+            echo "sourceCheckoutRefLiteral=${NC_SOURCE_COMMIT}"
+            echo "testedSourceIsWorkflowHead=false"
+            echo "testedSource=base ${NC_SOURCE_COMMIT} plus runtime fault-injection diff (NOT the untouched commit)"
+            echo "sourceClassPath=${NC_TEST_PATH}"
+            echo "sourceClassSha256BeforeInjection=${NC_TEST_SHA256}"
+            echo "injectionScope=runtime only, one test file, never committed, never upstream"
+            echo "matrixJava=none jobJava=17 (setup-java temurin)"
+            echo "mavenCache=no-cache-action (no cache restore, no borrowed generated artifacts)"
+            echo "TEST_IN_PR=${TEST_IN_PR} TESTCONTAINERS_RYUK_DISABLED=${TESTCONTAINERS_RYUK_DISABLED} RUN_ENGINES=${RUN_ENGINES}"
+            echo "MAVEN_OPTS=${MAVEN_OPTS}"
+            echo "engineFixtureImageExpected=eclipse-temurin:11-jdk (expected from public source; not a runtime-executed claim)"
+            echo "mysqlFixtureVersionExpected=8.0.43 (expected from public source; not a runtime-executed claim)"
+            echo "testTarget=org.apache.seatunnel.connectors.seatunnel.cdc.mysql.MysqlCDCStopModeSpecificIT"
+            echo "expectedOutcome=exactly one ConditionTimeoutException on the initial/latest-stop case; other six cases pass"
+            echo "evidenceClass=supplementary fork-only negative-control evidence; does not update or adopt the PR Build check"
+            uname -sm
+            java -version 2>&1
+            java -version 2>&1 | grep -q '"17\.' || { echo "::error::JDK 17 expected on the runtime, see java -version above."; exit 1; }
+            echo "jobJavaMajorVersion=17"
+            ./mvnw -v
+            repository="${HOME}/.m2/repository"
+            echo "mavenLocalRepositoryPresent=$([ -d "$repository" ] && echo true || echo false)"
+            if [ -d "$repository/org/apache/seatunnel" ] &&
+               [ -n "$(find "$repository/org/apache/seatunnel" -name '*SNAPSHOT*' -print -quit)" ]; then
+              echo "::error::Pre-existing SeaTunnel SNAPSHOT dependency found."
+              exit 1
+            fi
+            echo "preExistingSeaTunnelSnapshot=false"
+            echo "command=single source reactor verify; installOrReleaseBuild=absent"
+            docker version --format 'client={{.Client.Version}} server={{.Server.Version}}'
+            docker info --format 'architecture={{.Architecture}} cpus={{.NCPU}} memory={{.MemTotal}}'
+            df -h .
+          } | tee "${NC_EVIDENCE_DIR}/provenance.txt"
+          echo "NC_PROVENANCE_RECORDED=true" >> "${GITHUB_ENV}"
+      - name: Verify pinned test source hash before injection
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${NC_TEST_PATH}"
+          actual="$(sha256sum "${NC_TEST_PATH}" | awk '{print $1}')"
+          if [ "${actual}" != "${NC_TEST_SHA256}" ]; then
+            echo "::error::Pinned test source hash mismatch: expected ${NC_TEST_SHA256} but ${NC_TEST_PATH} has ${actual}."
+            exit 1
+          fi
+          cp "${NC_TEST_PATH}" "${NC_EVIDENCE_DIR}/MysqlCDCStopModeSpecificIT.before-injection.txt"
+          {
+            echo "sourceClassSha256BeforeInjection=${actual}"
+            echo "sourceClassSha256Expected=${NC_TEST_SHA256}"
+            echo "sourceClassPath=${NC_TEST_PATH}"
+            echo "sourceCheckoutSHA=$(git rev-parse HEAD)"
+            echo "negativeControlWorkflowSHA=${GITHUB_SHA}"
+          } > "${NC_EVIDENCE_DIR}/source-hashes.txt"
+          echo "NC_SOURCE_HASH_VERIFIED=true" >> "${GITHUB_ENV}"
+          # Export the hash that was actually verified above (not the pinned literal) so the gate
+          # can truthfully compare the before/after hashes of the same file.
+          echo "SOURCE_BEFORE_SHA256=${actual}" >> "${GITHUB_ENV}"
+          echo "sourceClassSha256BeforeInjection=${actual} matchesPinnedLiteral=true"
+      - name: Inject real MySQL sink fault at runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYINJECT'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["NC_TEST_PATH"])
+          expected = os.environ["NC_TEST_SHA256"]
+          original = path.read_text()
+          before = hashlib.sha256(original.encode()).hexdigest()
+          if before != expected:
+              raise SystemExit(f"source hash mismatch: {before} != {expected}")
+
+          # Anchor 1: after bulk insertion, before variables/job setup. Keep DDL out of
+          # the snapshot-readiness-to-source-UPDATE window.
+          anchor_setup = "        List<String> variables = new ArrayList<>();\n"
+          # Anchor 2: the existing final bounded value assertion (left byte-for-byte intact).
+          anchor_proof = (
+              "        // Job completion above is the real sync point;"
+              " the snapshot may still progress until then.\n"
+          )
+          if original.count(anchor_setup) != 1:
+              raise SystemExit("pre-start setup anchor not found exactly once")
+          if original.count(anchor_proof) != 1:
+              raise SystemExit("final value assertion anchor not found exactly once")
+
+          fault_setup = '''
+                  // OSS NEGATIVE CONTROL (fork-only workflow, test-runtime fault injection): make the
+                  // real MySQL sink deliberately lose exactly the value this case expects to observe.
+                  // No mock and no production change: dedicated BEFORE INSERT/BEFORE UPDATE triggers on
+                  // the real sink table rewrite only id=21/'latest-stop' to 'bulk' and audit the drop,
+                  // so the unchanged bounded value assertion below can be proven to still detect it.
+                  // Every other row and value is untouched. The triggers are created once per container,
+                  // so the remaining cases only ever see them fire for this same id/value pair, which
+                  // they do not assert.
+                  if ("initial".equals(startupMode)) {
+                      String negativeControlAudit = MYSQL_DATABASE + ".oss_negative_control_audit";
+                      executeSql(
+                              "CREATE TABLE IF NOT EXISTS "
+                                      + negativeControlAudit
+                                      + " (op_kind VARCHAR(16) NOT NULL, row_id INT NOT NULL,"
+                                      + " attempted_value VARCHAR(100) NOT NULL,"
+                                      + " recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+                                      + " ENGINE=InnoDB");
+                      executeSql(
+                              "DROP TRIGGER IF EXISTS "
+                                      + MYSQL_DATABASE
+                                      + ".oss_negative_control_insert");
+                      executeSql(
+                              "DROP TRIGGER IF EXISTS "
+                                      + MYSQL_DATABASE
+                                      + ".oss_negative_control_update");
+                      executeSql(
+                              "CREATE TRIGGER "
+                                      + MYSQL_DATABASE
+                                      + ".oss_negative_control_insert BEFORE INSERT ON "
+                                      + MYSQL_DATABASE
+                                      + "."
+                                      + SINK_TABLE
+                                      + " FOR EACH ROW BEGIN IF NEW.id = 21 AND NEW.f_varchar ="
+                                      + " 'latest-stop' THEN INSERT INTO "
+                                      + negativeControlAudit
+                                      + " (op_kind, row_id, attempted_value)"
+                                      + " VALUES ('insert', NEW.id, NEW.f_varchar);"
+                                      + " SET NEW.f_varchar = 'bulk'; END IF; END");
+                      executeSql(
+                              "CREATE TRIGGER "
+                                      + MYSQL_DATABASE
+                                      + ".oss_negative_control_update BEFORE UPDATE ON "
+                                      + MYSQL_DATABASE
+                                      + "."
+                                      + SINK_TABLE
+                                      + " FOR EACH ROW BEGIN IF NEW.id = 21 AND NEW.f_varchar ="
+                                      + " 'latest-stop' THEN INSERT INTO "
+                                      + negativeControlAudit
+                                      + " (op_kind, row_id, attempted_value)"
+                                      + " VALUES ('update', NEW.id, NEW.f_varchar);"
+                                      + " SET NEW.f_varchar = 'bulk'; END IF; END");
+                  }
+
+          '''
+
+          proof_check = '''
+                  // OSS NEGATIVE CONTROL: after the existing FINISHED wait and zero-exit check, prove the
+                  // injected fault really dropped a real sink write before the unchanged value assertion
+                  // runs, so a timeout can never be misread as proof of a lost value.
+                  if ("initial".equals(startupMode)) {
+                      String negativeControlSourceValue = null;
+                      String negativeControlSinkValue = null;
+                      long negativeControlBlockedWrites = -1L;
+                      try (Connection negativeControlConnection = getJdbcConnection();
+                              Statement negativeControlStatement =
+                                      negativeControlConnection.createStatement()) {
+                          try (ResultSet negativeControlResult =
+                                  negativeControlStatement.executeQuery(
+                                          String.format(
+                                                  "select f_varchar from %s.%s where id = 21",
+                                                  MYSQL_DATABASE, SOURCE_TABLE))) {
+                              if (negativeControlResult.next()) {
+                                  negativeControlSourceValue = negativeControlResult.getString(1);
+                              }
+                          }
+                          try (ResultSet negativeControlResult =
+                                  negativeControlStatement.executeQuery(
+                                          String.format(
+                                                  "select f_varchar from %s.%s where id = 21",
+                                                  MYSQL_DATABASE, SINK_TABLE))) {
+                              if (negativeControlResult.next()) {
+                                  negativeControlSinkValue = negativeControlResult.getString(1);
+                              }
+                          }
+                          try (ResultSet negativeControlResult =
+                                  negativeControlStatement.executeQuery(
+                                          "select count(*) from "
+                                                  + MYSQL_DATABASE
+                                                  + ".oss_negative_control_audit where row_id = 21"
+                                                  + " and attempted_value = 'latest-stop'")) {
+                              if (negativeControlResult.next()) {
+                                  negativeControlBlockedWrites = negativeControlResult.getLong(1);
+                              }
+                          }
+                      }
+                      if (!"latest-stop".equals(negativeControlSourceValue)
+                              || !"bulk".equals(negativeControlSinkValue)
+                              || negativeControlBlockedWrites < 1L) {
+                          throw new IllegalStateException(
+                                  "OSS_NEGATIVE_CONTROL_SETUP_FAILED source="
+                                          + negativeControlSourceValue
+                                          + " sink="
+                                          + negativeControlSinkValue
+                                          + " blocked="
+                                          + negativeControlBlockedWrites
+                                          + " finished=true");
+                      }
+                      System.out.println(
+                              "OSS_NEGATIVE_CONTROL_PROOF source=latest-stop sink=bulk blocked="
+                                      + negativeControlBlockedWrites
+                                      + " finished=true");
+                  }
+
+          '''
+
+          mutated = original.replace(anchor_setup, fault_setup + anchor_setup, 1)
+          mutated = mutated.replace(anchor_proof, proof_check + anchor_proof, 1)
+          if mutated == original:
+              raise SystemExit("injection produced no change")
+          path.write_text(mutated)
+          after = hashlib.sha256(mutated.encode()).hexdigest()
+          if after == before:
+              raise SystemExit("injected file hash unchanged")
+          print(f"NC_INJECTION_BEFORE_SHA256={before}")
+          print(f"NC_INJECTION_AFTER_SHA256={after}")
+          PYINJECT
+          after="$(sha256sum "${NC_TEST_PATH}" | awk '{print $1}')"
+          if [ "${after}" = "${NC_TEST_SHA256}" ]; then
+            echo "::error::Injection did not change ${NC_TEST_PATH}."
+            exit 1
+          fi
+          mapfile -t changed < <(git diff --name-only)
+          if [ "${#changed[@]}" -ne 1 ] || [ "${changed[0]}" != "${NC_TEST_PATH}" ]; then
+            echo "::error::Injection changed unexpected paths: ${changed[*]:-<none>}"
+            exit 1
+          fi
+          grep -q "oss_negative_control_insert" "${NC_TEST_PATH}"
+          grep -q "OSS_NEGATIVE_CONTROL_PROOF" "${NC_TEST_PATH}"
+          grep -q "post-snapshot update must be synced" "${NC_TEST_PATH}"
+          {
+            echo "injectionChangedPaths=${changed[0]}"
+            echo "injectionChangedPathCount=${#changed[@]}"
+            echo "sourceClassSha256AfterInjection=${after}"
+          } >> "${NC_EVIDENCE_DIR}/source-hashes.txt"
+          echo "SOURCE_AFTER_SHA256=${after}" >> "${GITHUB_ENV}"
+          echo "NC_INJECTION_APPLIED=true" >> "${GITHUB_ENV}"
+          echo "injectedChangedPaths=${changed[0]} count=${#changed[@]} after=${after}"
+      - name: Format only the injected test module
+        shell: bash
+        env:
+          MAVEN_OPTS: -Xmx4096m
+        run: |
+          set -euo pipefail
+          ./mvnw -B -pl :connector-cdc-mysql-e2e spotless:apply
+      - name: Reassert injected diff scope and save fault diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t changed < <(git diff --name-only)
+          if [ "${#changed[@]}" -ne 1 ] || [ "${changed[0]}" != "${NC_TEST_PATH}" ]; then
+            echo "::error::Formatting changed unexpected paths: ${changed[*]:-<none>}"
+            exit 1
+          fi
+          git diff -- "${NC_TEST_PATH}" > "${NC_EVIDENCE_DIR}/negative-control-fault.diff"
+          if [ ! -s "${NC_EVIDENCE_DIR}/negative-control-fault.diff" ]; then
+            echo "::error::Empty fault diff."
+            exit 1
+          fi
+          # The fault is an insertion only: no original line (assertion, bound, fixture or
+          # production statement) may be removed or rewritten by the injection.
+          removal_lines="$(grep -c '^-' "${NC_EVIDENCE_DIR}/negative-control-fault.diff" || true)"
+          header_lines="$(grep -c '^--- a/' "${NC_EVIDENCE_DIR}/negative-control-fault.diff" || true)"
+          removals=$(( ${removal_lines:-0} - ${header_lines:-0} ))
+          if [ "${removals}" -ne 0 ]; then
+            echo "::error::Injected diff removes ${removals} original line(s); it must be insertion-only."
+            exit 1
+          fi
+          after="$(sha256sum "${NC_TEST_PATH}" | awk '{print $1}')"
+          if [ "${after}" = "${NC_TEST_SHA256}" ]; then
+            echo "::error::Formatted file matches the untouched pinned source; fault is gone."
+            exit 1
+          fi
+          grep -q "post-snapshot update must be synced" "${NC_TEST_PATH}"
+          grep -q "atMost(120, TimeUnit.SECONDS)" "${NC_TEST_PATH}"
+          SOURCE_AFTER_SHA256="${after}"
+          sed -i "/^sourceClassSha256AfterInjection=/d" "${NC_EVIDENCE_DIR}/source-hashes.txt"
+          echo "sourceClassSha256AfterInjection=${SOURCE_AFTER_SHA256}" >> "${NC_EVIDENCE_DIR}/source-hashes.txt"
+          echo "faultDiffInsertionOnly=true removedOriginalLines=0"
+          git diff --stat -- "${NC_TEST_PATH}"
+          echo "SOURCE_AFTER_SHA256=${SOURCE_AFTER_SHA256}" >> "${GITHUB_ENV}"
+          echo "NC_FAULT_DIFF_VERIFIED=true" >> "${GITHUB_ENV}"
+      - name: Run MySQL CDC stop-mode integration test (expected to fail)
+        id: itest
+        continue-on-error: true
+        shell: bash
+        env:
+          MAVEN_OPTS: -Xmx4096m
+        run: |
+          set -o pipefail
+          ./mvnw -B -T 1 verify -DskipUT=true -DskipIT=false -Dlicense.skipAddThirdParty=true -Dskip.ui=true --no-snapshot-updates -pl :connector-cdc-mysql-e2e -am -Pci -Dit.test=MysqlCDCStopModeSpecificIT -DfailIfNoTests=false -Dit.failIfNoSpecifiedTests=false 2>&1 | tee "${NC_EVIDENCE_DIR}/itest-console.log"
+      - name: Record fixture container image provenance
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          output="${NC_EVIDENCE_DIR}"
+          mkdir -p "$output"
+          record="${output}/fixture-images.txt"
+          : > "$record"
+          echo "native=$(uname -sm) dockerArch=$(docker info --format '{{.Architecture}}')" >> "$record"
+          for image in eclipse-temurin:11-jdk mysql:8.0.43; do
+            if docker image inspect "$image" > /dev/null 2>&1; then
+              docker image inspect "$image" \
+                --format "image=$image present=true arch={{.Architecture}} os={{.Os}} id={{.Id}} created={{.Created}}" \
+                >> "$record"
+            else
+              echo "image=$image present=false (not pulled by this run; no extra pull performed)" >> "$record"
+            fi
+          done
+          cat "$record"
+      - name: Validate negative-control evidence
+        id: validate
+        if: always()
+        shell: bash
+        env:
+          # The other flags are exported by earlier steps through GITHUB_ENV and are therefore
+          # already present in this step's process environment.
+          NC_MAVEN_OUTCOME: ${{ steps.itest.outcome }}
+        run: |
+          set -o pipefail
+          python3 - <<'PYGATE'
+          import json
+          import os
+          import re
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          CLASSNAME = (
+              "org.apache.seatunnel.connectors.seatunnel.cdc.mysql.MysqlCDCStopModeSpecificIT"
+          )
+          EXPECTED = [
+              "testMysqlCdcStopModeSpecificTerminatesAtStopOffset",
+              "testMysqlCdcStopModeSpecificWithTimestampStartup",
+              "testMysqlCdcInitialStartupWithLatestStop",
+              "testMysqlCdcEarliestStartupWithLatestStop",
+              "testMysqlCdcLatestStartupWithLatestStop",
+              "testMysqlCdcSpecificStartupWithLatestStop",
+              "testMysqlCdcTimestampStartupWithLatestStop",
+          ]
+          FAILING_METHOD = "testMysqlCdcInitialStartupWithLatestStop"
+          ERROR_TYPE = "org.awaitility.core.ConditionTimeoutException"
+          REQUIRED_ERROR_TEXT = [
+              "post-snapshot update must be synced",
+              "latest-stop",
+              "bulk",
+          ]
+          MARKER = re.compile(
+              r"OSS_NEGATIVE_CONTROL_PROOF source=latest-stop sink=bulk blocked=(\d+) finished=true"
+          )
+          SETUP_FAILED = "OSS_NEGATIVE_CONTROL_SETUP_FAILED"
+
+          test_path = os.environ["NC_TEST_PATH"]
+          evidence = Path(os.environ["NC_EVIDENCE_DIR"])
+          report_dir = Path(
+              "seatunnel-e2e/seatunnel-connector-v2-e2e/connector-cdc-mysql-e2e"
+              "/target/failsafe-reports"
+          )
+          reports = sorted(report_dir.glob("TEST-*.xml"))
+          checks = {}
+          notes = []
+
+          def check(name, condition, detail=""):
+              checks[name] = bool(condition)
+              if not condition and detail:
+                  notes.append(f"{name}: {detail}")
+              return bool(condition)
+
+          # 1. The Maven step must have FAILED (outcome, not conclusion: the step itself is
+          #    allowed to continue so the remaining evidence steps still run).
+          check(
+              "mavenStepOutcomeIsFailure",
+              os.environ.get("NC_MAVEN_OUTCOME") == "failure",
+              f"steps.itest.outcome={os.environ.get('NC_MAVEN_OUTCOME')!r}",
+          )
+
+          # 2. Source / injection provenance must be complete and self-consistent.
+          for flag in (
+              "NC_SOURCE_HASH_VERIFIED",
+              "NC_INJECTION_APPLIED",
+              "NC_FAULT_DIFF_VERIFIED",
+              "NC_SOURCE_FRESH_CHECKOUT",
+              "NC_PROVENANCE_RECORDED",
+          ):
+              check(f"provenanceFlag{flag}", os.environ.get(flag) == "true", f"{flag}=false")
+
+          source_before = os.environ.get("SOURCE_BEFORE_SHA256", "")
+          source_after = os.environ.get("SOURCE_AFTER_SHA256", "")
+          check(
+              "sourceBeforeInjectionMatchesPinnedLiteral",
+              source_before == os.environ["NC_TEST_SHA256"],
+              f"before={source_before!r}",
+          )
+          check(
+              "sourceAfterInjectionDiffersFromPinnedLiteral",
+              bool(source_after) and source_after != os.environ["NC_TEST_SHA256"],
+              f"after={source_after!r}",
+          )
+          current = ""
+          if Path(test_path).is_file():
+              import hashlib
+
+              current = hashlib.sha256(Path(test_path).read_bytes()).hexdigest()
+          check("sourceAfterInjectionHashMatchesWorktree", current == source_after, f"{current!r}")
+
+          provenance = evidence / "provenance.txt"
+          provenance_text = provenance.read_text() if provenance.is_file() else ""
+          check("provenanceFilePresent", bool(provenance_text))
+          for fragment in (
+              f"sourceCheckoutSHA={os.environ['NC_SOURCE_COMMIT']}",
+              "testedSourceIsWorkflowHead=false",
+              f"testedSource=base {os.environ['NC_SOURCE_COMMIT']} plus runtime fault-injection diff",
+              "mavenCache=no-cache-action",
+              "jobJavaMajorVersion=17",
+          ):
+              check(
+                  f"provenanceContains:{fragment}",
+                  fragment in provenance_text,
+                  "missing from provenance.txt",
+              )
+          hashes = evidence / "source-hashes.txt"
+          hashes_text = hashes.read_text() if hashes.is_file() else ""
+          check(
+              "sourceHashesRecordedBeforeAndAfter",
+              f"sourceClassSha256BeforeInjection={os.environ['NC_TEST_SHA256']}" in hashes_text
+              and f"sourceClassSha256AfterInjection={source_after}" in hashes_text,
+          )
+          # The recorded workflow revision must be this run's revision, not an unverified string.
+          workflow_sha = os.environ.get("GITHUB_SHA", "")
+          check(
+              "provenanceWorkflowShaMatchesGitHubSha",
+              bool(workflow_sha)
+              and f"negativeControlWorkflowSHA={workflow_sha}" in provenance_text,
+              f"GITHUB_SHA={workflow_sha!r}",
+          )
+          # Fixture container images must be the expected tags, actually present, on amd64/linux.
+          images = evidence / "fixture-images.txt"
+          images_text = images.read_text() if images.is_file() else ""
+          check("fixtureImagesFilePresent", bool(images_text.strip()))
+          for expected_image in ("eclipse-temurin:11-jdk", "mysql:8.0.43"):
+              image_lines = [
+                  line
+                  for line in images_text.splitlines()
+                  if line.startswith(f"image={expected_image} ")
+              ]
+              image_line = image_lines[0] if len(image_lines) == 1 else ""
+              check(
+                  f"fixtureImagePresentOnExpectedPlatform:{expected_image}",
+                  bool(image_line)
+                  and "present=true" in image_line
+                  and "arch=amd64" in image_line
+                  and "os=linux" in image_line,
+                  f"lines={image_lines[:1]}",
+              )
+          diff = evidence / "negative-control-fault.diff"
+          diff_text = diff.read_text() if diff.is_file() else ""
+          check("faultDiffPresent", bool(diff_text.strip()))
+          check(
+              "faultDiffTouchesOnlyPinnedTestFile",
+              f"+++ b/{test_path}" in diff_text
+              and diff_text.count("+++ ") == 1
+              and diff_text.count("--- ") == 1,
+          )
+          removed_lines = [
+              line
+              for line in diff_text.splitlines()
+              if line.startswith("-") and not line.startswith("--- ")
+          ]
+          check("faultDiffAddsOnly", not removed_lines, f"removed lines: {removed_lines[:3]}")
+          for fragment in (
+              "BEFORE INSERT ON",
+              "BEFORE UPDATE ON",
+              "oss_negative_control_audit",
+              "SET NEW.f_varchar = 'bulk'",
+              "OSS_NEGATIVE_CONTROL_PROOF",
+          ):
+              check(f"faultDiffContains:{fragment}", fragment in diff_text, "missing from diff")
+          # The unchanged assertion text is context, not an added line, so a short-context diff need
+          # not carry it. Verify it directly against the injected Java source and against the
+          # pre-injection copy that was saved before the fault was applied.
+          ASSERTION_TEXT = "post-snapshot update must be synced"
+          injected_source = Path(test_path).read_text() if Path(test_path).is_file() else ""
+          before_copy = evidence / "MysqlCDCStopModeSpecificIT.before-injection.txt"
+          before_text = before_copy.read_text() if before_copy.is_file() else ""
+          check(
+              "unchangedAssertionTextPresentInInjectedSource",
+              bool(injected_source) and ASSERTION_TEXT in injected_source,
+              "injected source no longer carries the awaited assertion text",
+          )
+          check(
+              "unchangedAssertionTextCountPreserved",
+              bool(before_text)
+              and ASSERTION_TEXT in before_text
+              and injected_source.count(ASSERTION_TEXT) == before_text.count(ASSERTION_TEXT),
+              f"before={before_text.count(ASSERTION_TEXT)} "
+              f"after={injected_source.count(ASSERTION_TEXT)}",
+          )
+
+          # 3. Real Failsafe XML must exist with exactly the seven expected cases.
+          cases = []
+          system_out = []
+          unparsable_reports = []
+          for report in reports:
+              try:
+                  root = ET.parse(report).getroot()
+              except ET.ParseError as error:
+                  unparsable_reports.append(f"{report.name}: {error}")
+                  notes.append(f"unparsable report {report}: {error}")
+                  continue
+              if root.findtext("system-out"):
+                  system_out.append(root.findtext("system-out"))
+              for case in root.iter("testcase"):
+                  if case.get("classname", "") == CLASSNAME:
+                      cases.append(case)
+
+          check("failsafeXmlPresent", bool(reports) and bool(cases), f"reports={len(reports)}")
+          # A single unparsable report must fail the evidence even if another report is valid:
+          # an unreadable report could hide errors or extra cases.
+          check(
+              "allReportsParsedCleanly",
+              bool(reports) and not unparsable_reports,
+              f"unparsable={unparsable_reports}",
+          )
+
+          names = [(case.get("name") or "").split("{", 1)[0] for case in cases]
+          skipped = sum(1 for case in cases if case.find("skipped") is not None)
+          failures = sum(1 for case in cases if case.find("failure") is not None)
+          error_cases = [case for case in cases if case.find("error") is not None]
+          errors = len(error_cases)
+          executed = len(cases) - skipped
+
+          missing = sorted(set(EXPECTED) - set(names))
+          unexpected = sorted(set(names) - set(EXPECTED))
+          duplicates = sorted({name for name in names if names.count(name) > 1})
+          set_matches = (
+              not missing
+              and not unexpected
+              and not duplicates
+              and len(names) == len(EXPECTED)
+              and len(cases) == len(EXPECTED)
+          )
+          check(
+              "exactlySevenUniqueExpectedMethods",
+              set_matches,
+              f"missing={missing} unexpected={unexpected} duplicates={duplicates}",
+          )
+          check("sevenExecuted", executed == len(EXPECTED), f"executed={executed}")
+          check("zeroSkipped", skipped == 0, f"skipped={skipped}")
+          check("zeroFailures", failures == 0, f"failures={failures}")
+          check(
+              "exactlyOneError",
+              errors == 1 and error_cases and (error_cases[0].get("name") or "").split("{", 1)[0]
+              == FAILING_METHOD,
+              f"errors={errors}",
+          )
+
+          error_type = ""
+          error_text = ""
+          if error_cases:
+              error_element = error_cases[0].find("error")
+              error_type = error_element.get("type", "") or ""
+              error_text = (error_element.text or "") + (error_element.get("message", "") or "")
+          check("errorTypeIsConditionTimeout", error_type == ERROR_TYPE, f"type={error_type!r}")
+          for fragment in REQUIRED_ERROR_TEXT:
+              check(
+                  f"errorTextContains:{fragment}",
+                  fragment in error_text,
+                  "missing from the awaited failure text",
+              )
+
+          # 3b. The other six target cases must have completed without failure or error; compute
+          #     this from the real XML instead of assuming it, and require it for success.
+          other_cases = [
+              case
+              for case in cases
+              if (case.get("name") or "").split("{", 1)[0] != FAILING_METHOD
+          ]
+          other_unhealthy = sorted(
+              {
+                  (case.get("name") or "").split("{", 1)[0]
+                  for case in other_cases
+                  if case.find("failure") is not None or case.find("error") is not None
+              }
+          )
+          other_six_failed_or_errored = bool(other_unhealthy)
+          other_six_present = len(other_cases) == len(EXPECTED) - 1
+          check(
+              "otherSixCasesFailedOrErroredIsFalse",
+              other_six_present and not other_six_failed_or_errored,
+              f"otherCases={len(other_cases)} unhealthy={other_unhealthy}",
+          )
+
+          # 4. The proof marker with a real blocked-write count must come from the XML output.
+          marker_text = "\n".join(system_out + [(case.findtext("system-out") or "") for case in cases])
+          blocked_counts = [int(match.group(1)) for match in MARKER.finditer(marker_text)]
+          blocked = max(blocked_counts) if blocked_counts else -1
+          check("proofMarkerPresentInXml", bool(blocked_counts))
+          check("proofMarkerBlockedWritesAtLeastOne", blocked >= 1, f"blocked={blocked}")
+          check("noControlSetupFailureMarker", SETUP_FAILED not in marker_text)
+
+          proven = all(checks.values())
+          payload = {
+              "negativeControl": True,
+              "evidence": (
+                  "NEGATIVE_CONTROL_EXPECTED_FAILURE" if proven else "NEGATIVE_CONTROL_NOT_PROVEN"
+              ),
+              "target": CLASSNAME,
+              "testedSource": {
+                  "base": os.environ["NC_SOURCE_COMMIT"],
+                  "modification": "runtime fault-injection diff, one test file, never committed",
+                  "testedSourceIsWorkflowHead": False,
+                  "sourceClassSha256BeforeInjection": source_before,
+                  "sourceClassSha256AfterInjection": source_after,
+              },
+              "workflow": {
+                  "workflowSHA": os.environ.get("GITHUB_SHA", ""),
+                  "workflowRef": os.environ.get("GITHUB_REF", ""),
+                  "mavenStepOutcome": os.environ.get("NC_MAVEN_OUTCOME", ""),
+                  "failsafeReportDir": str(report_dir),
+                  "failsafeXmlFiles": len(reports),
+              },
+              "faultInjection": {
+                  "location": "MysqlCDCStopModeSpecificIT.runLatestStopStartupMode (initial only)",
+                  "mechanism": (
+                      "MySQL BEFORE INSERT / BEFORE UPDATE triggers on the real sink table "
+                      "rewrite id=21/'latest-stop' to 'bulk' and audit the dropped write"
+                  ),
+                  "faultDiffArtifact": "negative-control-fault.diff",
+                  "controlledDatabaseWriteLoss": True,
+                  "claimsNewEngineBug": False,
+              },
+              "cases": {
+                  "expected": len(EXPECTED),
+                  "expectedMethods": EXPECTED,
+                  "observed": len(cases),
+                  "executed": executed,
+                  "skipped": skipped,
+                  "failures": failures,
+                  "errors": errors,
+                  "executedMethods": sorted(names),
+                  "missingMethods": missing,
+                  "unexpectedMethods": unexpected,
+                  "duplicateMethods": duplicates,
+                  "methodSetMatchesExactly": set_matches,
+              },
+              "observedFailure": {
+                  "method": FAILING_METHOD,
+                  "errorType": error_type,
+                  "requiredText": REQUIRED_ERROR_TEXT,
+                  "otherSixCasesFailedOrErrored": other_six_failed_or_errored,
+                  "otherSixCasesObserved": len(other_cases),
+                  "otherCasesFailedOrErroredMethods": other_unhealthy,
+              },
+              "proofMarker": {
+                  "pattern": "OSS_NEGATIVE_CONTROL_PROOF source=latest-stop sink=bulk blocked=N finished=true",
+                  "occurrences": len(blocked_counts),
+                  "blockedWriteCount": blocked,
+              },
+              "sevenTestsPassed": False,
+              "priorPositiveEvidence": {
+                  "runId": "40203109932",
+                  "note": "existing positive evidence preserved; not rerun by this workflow",
+              },
+              "checks": checks,
+              "unmetChecks": sorted(name for name, ok in checks.items() if not ok),
+              "evidenceClass": "supplementary fork-only negative control; not a PR-bound Build result",
+          }
+          (evidence / "mysql-negative-control.json").write_text(
+              json.dumps(payload, indent=2) + "\n"
+          )
+          text = (
+              f"target={CLASSNAME} evidence={payload['evidence']} "
+              f"mavenStepOutcome={payload['workflow']['mavenStepOutcome']} "
+              f"failsafeXmlFiles={len(reports)} cases={len(cases)} executed={executed} "
+              f"skipped={skipped} failures={failures} errors={errors} "
+              f"expected={len(EXPECTED)} methodSetMatchesExactly={set_matches} "
+              f"errorType={error_type or '<none>'} blockedWrites={blocked}\n"
+              f"sourceClassSha256BeforeInjection={source_before or '<none>'} "
+              f"sourceClassSha256AfterInjection={source_after or '<none>'}\n"
+              f"unmetChecks={','.join(payload['unmetChecks']) if payload['unmetChecks'] else '<none>'}\n"
+          )
+          (evidence / "negative-control-summary.txt").write_text(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(
+                  "Supplementary fork-only MySQL CDC stop-mode negative control "
+                  "(deliberate sink fault injection). This does not update or adopt the PR "
+                  "Build check.\n\n" + text
+              )
+          print(text, end="")
+          if notes:
+              print("notes: " + " | ".join(notes))
+          if not proven:
+              raise SystemExit(
+                  "NEGATIVE_CONTROL_NOT_PROVEN: the expected single ConditionTimeoutException "
+                  "evidence set was not observed; see unmetChecks above."
+              )
+          PYGATE
+      - name: Upload negative-control evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-cdc-stop-mode-negative-control-attempt${{ github.run_attempt }}
+          path: |
+            ${{ env.NC_EVIDENCE_DIR }}/provenance.txt
+            ${{ env.NC_EVIDENCE_DIR }}/source-hashes.txt
+            ${{ env.NC_EVIDENCE_DIR }}/negative-control-fault.diff
+            ${{ env.NC_EVIDENCE_DIR }}/negative-control-summary.txt
+            ${{ env.NC_EVIDENCE_DIR }}/mysql-negative-control.json
+            ${{ env.NC_EVIDENCE_DIR }}/fixture-images.txt
+            ${{ env.NC_EVIDENCE_DIR }}/MysqlCDCStopModeSpecificIT.before-injection.txt
+            ${{ env.NC_EVIDENCE_DIR }}/itest-console.log
+            **/target/failsafe-reports/*.xml
+            **/target/surefire-reports/*.xml
+          retention-days: 7
+          if-no-files-found: warn
