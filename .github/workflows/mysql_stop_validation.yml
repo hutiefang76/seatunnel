@@ -1,0 +1,452 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# Fork-only repeated-run validation for issue #12959.
+#
+# This workflow exists ONLY on the fork branch below. It never ships upstream:
+# the job itself refuses to run outside hutiefang76/seatunnel, and the pinned
+# source checkout is asserted to be free of this file so the tested revision is
+# pure upstream-independent source with no validation scaffolding inside it.
+#
+# Purpose: a maintainer asked for a few *consecutive* passing runs. A single run
+# is not evidence of stability, so the same focused seven-method reactor
+# verification is executed three times sequentially against the exact pinned
+# source revision, and each round is gated independently and strictly.
+
+name: 'MySQL CDC stop-mode repeated-run validation'
+
+on:
+  push:
+    # Narrowly scoped: forks only trigger this on the dedicated validation branch.
+    branches:
+      - 'frank/mysql12959-ci-validation-20261026'
+
+permissions:
+  contents: read
+
+env:
+  RUN_ENGINES: 'zeta'
+  TEST_IN_PR: 'true'
+  TESTCONTAINERS_RYUK_DISABLED: 'true'
+
+jobs:
+  mysql-cdc-stop-mode-validation:
+    # Fork-only guard: makes this workflow a no-op anywhere but the owner fork,
+    # so it can never act as an upstream check even if copied by accident.
+    if: github.repository == 'hutiefang76/seatunnel'
+    name: MySQL CDC stop-mode repeated validation (Ubuntu AMD64, JDK 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      MAVEN_OPTS: -Xmx4096m
+      PINNED_SOURCE_SHA: 'd0133119267adeb020fb2182de79a628180346b7'
+      PINNED_SOURCE_REPOSITORY: 'hutiefang76/seatunnel'
+      TARGET_CLASS: 'org.apache.seatunnel.connectors.seatunnel.cdc.mysql.MysqlCDCStopModeSpecificIT'
+      FAILSAFE_DIR: 'seatunnel-e2e/seatunnel-connector-v2-e2e/connector-cdc-mysql-e2e/target/failsafe-reports'
+      SUREFIRE_DIR: 'seatunnel-e2e/seatunnel-connector-v2-e2e/connector-cdc-mysql-e2e/target/surefire-reports'
+    steps:
+      - name: Check out pinned source
+        uses: actions/checkout@v4
+        with:
+          repository: hutiefang76/seatunnel
+          ref: d0133119267adeb020fb2182de79a628180346b7
+          persist-credentials: false
+
+      - name: Assert source revision, platform and fresh checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${PINNED_SOURCE_SHA}"
+          # Ubuntu AMD64 runner, as required for the MySQL CDC fixture.
+          test "$(uname -m)" = x86_64
+          test "${RUN_ENGINES}" = zeta
+          # No Maven cache action is used, so a fresh checkout must contain no
+          # borrowed build output that could mask a compile or test regression.
+          test -z "$(find . -path ./.git -prune -o -type d -name target -not -path '*/src/*' -print)"
+          # The tested revision must be plain source; this fork-only workflow
+          # scaffolding may never be part of what gets validated.
+          test ! -e .github/workflows/mysql_stop_validation.yml
+          echo "SOURCE_CHECKOUT_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+          echo "sourceRevisionPinned=true freshCheckoutNoTargetDirs=true testedSourceHasNoValidationScaffolding=true"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          # Deliberately no `cache: maven`: every round must resolve and compile
+          # from a cold, unborrowed state.
+
+      - name: free disk space
+        run: tools/github/free_disk_space.sh
+
+      - name: Record source and runtime provenance
+        shell: bash
+        run: |
+          set -uo pipefail
+          output="${RUNNER_TEMP}/mysql-validation"
+          mkdir -p "$output"
+          {
+            echo "workflowFile=.github/workflows/mysql_stop_validation.yml (fork-only; not part of tested source)"
+            echo "validationWorkflowSHA=${GITHUB_SHA}"
+            echo "validationBranch=${GITHUB_REF}"
+            echo "sourceCheckoutSHA=$(git rev-parse HEAD)"
+            echo "sourceCheckoutRepository=${PINNED_SOURCE_REPOSITORY}"
+            echo "sourceCheckoutRefLiteral=${PINNED_SOURCE_SHA}"
+            echo "targetClass=${TARGET_CLASS}"
+            echo "rounds=3 roundsAreSequential=true"
+            echo "runnerOs=$(uname -s) runnerArch=$(uname -m)"
+            echo "jobJava=17 (setup-java temurin)"
+            echo "mavenCache=no-cache-action (no cache restore, no borrowed generated artifacts)"
+            echo "TEST_IN_PR=${TEST_IN_PR} TESTCONTAINERS_RYUK_DISABLED=${TESTCONTAINERS_RYUK_DISABLED} RUN_ENGINES=${RUN_ENGINES}"
+            echo "MAVEN_OPTS=${MAVEN_OPTS}"
+            echo "engineFixtureImageExpected=eclipse-temurin:11-jdk (expected from pinned source; not a runtime-executed claim)"
+            echo "mysqlFixtureVersionExpected=8.0.43 (expected from pinned source; not a runtime-executed claim)"
+            echo "evidenceClass=pinned-source repeated-run test evidence for issue #12959; does not update or adopt the PR Build check"
+            java -version 2>&1
+            ./mvnw -v
+            repository="${HOME}/.m2/repository"
+            echo "mavenLocalRepositoryPresent=$([ -d "$repository" ] && echo true || echo false)"
+            if [ -d "$repository/org/apache/seatunnel" ] &&
+               [ -n "$(find "$repository/org/apache/seatunnel" -name '*SNAPSHOT*' -print -quit)" ]; then
+              echo "preExistingSeaTunnelSnapshot=true"
+            else
+              echo "preExistingSeaTunnelSnapshot=false"
+            fi
+            echo "command=three sequential source-reactor verifies; installOrReleaseBuild=absent"
+            docker version --format 'client={{.Client.Version}} server={{.Server.Version}}'
+            docker info --format 'architecture={{.Architecture}} cpus={{.NCPU}} memory={{.MemTotal}}'
+            df -h .
+          } | tee "${output}/provenance.txt"
+          if grep -q '^preExistingSeaTunnelSnapshot=true$' "${output}/provenance.txt"; then
+            echo "::error::Pre-existing SeaTunnel SNAPSHOT dependency found in the local Maven repository."
+            exit 1
+          fi
+
+      - name: Run three sequential pinned-source reactor verifications
+        shell: bash
+        run: |
+          # No `set -e`: every exit status below is captured and propagated
+          # explicitly so that a failing Maven run can never be reported green.
+          set -uo pipefail
+
+          ROOT="${RUNNER_TEMP}/mysql-validation"
+          ROUNDS=3
+          mkdir -p "$ROOT"
+          : > "${ROOT}/rounds.tsv"
+          completed=0
+          failed_round=0
+
+          for round in $(seq 1 "${ROUNDS}"); do
+            round_dir="${ROOT}/round-${round}"
+            # A stale round directory or stale Failsafe output would let a
+            # previous round satisfy this round's gate; wipe both first.
+            rm -rf "$round_dir"
+            mkdir -p "${round_dir}/failsafe-reports" "${round_dir}/surefire-reports"
+            rm -rf "${FAILSAFE_DIR}" "${SUREFIRE_DIR}"
+
+            echo "::group::Round ${round}/${ROUNDS} reactor verify"
+            echo "round=${round} command=./mvnw -B -T 1 verify -DskipUT=true -DskipIT=false -Dlicense.skipAddThirdParty=true -Dskip.ui=true --no-snapshot-updates -pl :connector-cdc-mysql-e2e -am -Pci -Dit.test=MysqlCDCStopModeSpecificIT -DfailIfNoTests=false -Dit.failIfNoSpecifiedTests=false"
+
+            ./mvnw -B -T 1 verify \
+              -DskipUT=true \
+              -DskipIT=false \
+              -D"license.skipAddThirdParty"=true \
+              -D"skip.ui"=true \
+              --no-snapshot-updates \
+              -pl :connector-cdc-mysql-e2e \
+              -am \
+              -Pci \
+              -Dit.test=MysqlCDCStopModeSpecificIT \
+              -DfailIfNoTests=false \
+              -Dit.failIfNoSpecifiedTests=false \
+              2>&1 | tee "${round_dir}/maven.log"
+            # Honour the Maven status, not tee's.
+            maven_status="${PIPESTATUS[0]}"
+            echo "::endgroup::"
+
+            printf '%s\n' "${maven_status}" > "${round_dir}/maven-exit-code.txt"
+            echo "round=${round} mavenExitStatus=${maven_status}"
+
+            # Snapshot this round's evidence BEFORE the next round overwrites it.
+            if [ -d "${FAILSAFE_DIR}" ]; then
+              cp -a "${FAILSAFE_DIR}/." "${round_dir}/failsafe-reports/" 2>/dev/null || true
+            fi
+            if [ -d "${SUREFIRE_DIR}" ]; then
+              cp -a "${SUREFIRE_DIR}/." "${round_dir}/surefire-reports/" 2>/dev/null || true
+            fi
+
+            {
+              echo "round=${round}"
+              echo "mavenExitStatus=${maven_status}"
+              echo "sourceCheckoutSHA=$(git rev-parse HEAD)"
+              echo "validationWorkflowSHA=${GITHUB_SHA}"
+              echo "recordedAtUtc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "runnerArch=$(uname -m)"
+              java -version 2>&1
+              docker version --format 'dockerClientVersion={{.Client.Version}} dockerServerVersion={{.Server.Version}}' || true
+              echo "failsafeXmlInSnapshot=$(find "${round_dir}/failsafe-reports" -name 'TEST-*.xml' -print | wc -l | tr -d ' ')"
+            } > "${round_dir}/provenance.txt" 2>&1
+
+            # Record fixture images actually present for this round.
+            record="${round_dir}/fixture-images.txt"
+            : > "$record"
+            for image in eclipse-temurin:11-jdk mysql:8.0.43; do
+              if docker image inspect "$image" > /dev/null 2>&1; then
+                docker image inspect "$image" \
+                  --format "image=$image present=true arch={{.Architecture}} os={{.Os}} id={{.Id}} created={{.Created}}" \
+                  >> "$record"
+              else
+                echo "image=$image present=false (not pulled by this run; no extra pull performed)" >> "$record"
+              fi
+            done
+
+            # Strict per-round gate: exact seven methods, nothing skipped, no
+            # failures/errors, Maven exit status must be zero.
+            python3 - "${round_dir}/failsafe-reports" "${round_dir}" "${round}" "${maven_status}" <<'PYGATE'
+          import json
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          CLASSNAME = "org.apache.seatunnel.connectors.seatunnel.cdc.mysql.MysqlCDCStopModeSpecificIT"
+          EXPECTED = [
+              "testMysqlCdcStopModeSpecificTerminatesAtStopOffset",
+              "testMysqlCdcStopModeSpecificWithTimestampStartup",
+              "testMysqlCdcInitialStartupWithLatestStop",
+              "testMysqlCdcEarliestStartupWithLatestStop",
+              "testMysqlCdcLatestStartupWithLatestStop",
+              "testMysqlCdcSpecificStartupWithLatestStop",
+              "testMysqlCdcTimestampStartupWithLatestStop",
+          ]
+
+          report_dir = Path(sys.argv[1])
+          round_dir = Path(sys.argv[2])
+          round_name = sys.argv[3]
+          maven_status_raw = sys.argv[4]
+
+          problems = []
+
+          try:
+              maven_status = int(maven_status_raw)
+          except (TypeError, ValueError):
+              maven_status = -1
+              problems.append(f"mavenExitStatus is not an integer: {maven_status_raw!r}")
+
+          reports = sorted(report_dir.glob("TEST-*.xml")) if report_dir.is_dir() else []
+          cases = []
+          parse_errors = []
+          for report in reports:
+              try:
+                  root = ET.parse(report).getroot()
+              except ET.ParseError as exc:
+                  parse_errors.append(f"{report.name}: {exc}")
+                  continue
+              for case in root.iter("testcase"):
+                  if case.get("classname", "") == CLASSNAME:
+                      cases.append(case)
+
+          names = [(case.get("name") or "").split("{", 1)[0].strip() for case in cases]
+
+          skipped_names = []
+          failure_names = []
+          error_names = []
+          for case, name in zip(cases, names):
+              if case.find("skipped") is not None:
+                  skipped_names.append(name)
+              if case.find("failure") is not None:
+                  failure_names.append(name)
+              if case.find("error") is not None:
+                  error_names.append(name)
+
+          skipped = len(skipped_names)
+          failures = len(failure_names)
+          errors = len(error_names)
+          executed = len(cases) - skipped
+
+          expected_set = set(EXPECTED)
+          actual_set = set(names)
+          missing = sorted(expected_set - actual_set)
+          unexpected = sorted(actual_set - expected_set)
+          duplicates = sorted({n for n in names if names.count(n) > 1})
+
+          # --- strict gate: any single violation fails the round ---------------
+          if maven_status != 0:
+              problems.append(f"mavenExitStatus={maven_status} (expected 0)")
+          if not report_dir.is_dir():
+              problems.append(f"Failsafe report directory is missing: {report_dir}")
+          if not reports:
+              problems.append("no TEST-*.xml captured for this round (missing reports)")
+          if parse_errors:
+              problems.append("unparseable Failsafe XML: " + "; ".join(parse_errors))
+          if not cases:
+              problems.append(f"no <testcase> for {CLASSNAME} (test did not run)")
+          if missing:
+              problems.append("missing methods: " + ",".join(missing))
+          if unexpected:
+              problems.append("unexpected methods: " + ",".join(unexpected))
+          if duplicates:
+              problems.append("duplicate methods: " + ",".join(duplicates))
+          if len(names) != len(EXPECTED):
+              problems.append(f"executed method count {len(names)} != expected {len(EXPECTED)}")
+          if len(cases) != len(EXPECTED):
+              problems.append(f"testcase count {len(cases)} != expected {len(EXPECTED)}")
+          if skipped:
+              problems.append(f"skipped={skipped} (expected 0): " + ",".join(skipped_names))
+          if failures:
+              problems.append(f"failures={failures} (expected 0): " + ",".join(sorted(set(failure_names))))
+          if errors:
+              problems.append(f"errors={errors} (expected 0): " + ",".join(sorted(set(error_names))))
+
+          method_set_matches = not missing and not unexpected and not duplicates and len(names) == len(EXPECTED)
+          verdict = "PASSED" if not problems else "FAILED"
+
+          payload = {
+              "round": int(round_name) if str(round_name).isdigit() else round_name,
+              "target": CLASSNAME,
+              "evidence": verdict,
+              "problems": problems,
+              "mavenExitStatus": maven_status,
+              "failsafeReportDir": str(report_dir),
+              "failsafeXmlFiles": len(reports),
+              "cases": len(cases),
+              "executed": executed,
+              "skipped": skipped,
+              "failures": failures,
+              "errors": errors,
+              "expectedCaseCount": len(EXPECTED),
+              "expectedMethods": EXPECTED,
+              "executedMethods": sorted(names),
+              "missingMethods": missing,
+              "unexpectedMethods": unexpected,
+              "duplicateMethods": duplicates,
+              "skippedMethods": skipped_names,
+              "failedMethods": sorted(set(failure_names)),
+              "errorMethods": sorted(set(error_names)),
+              "methodSetMatchesExactly": method_set_matches,
+              "sourceCheckoutSHA": os.environ.get("SOURCE_CHECKOUT_SHA", ""),
+              "validationWorkflowSHA": os.environ.get("GITHUB_SHA", ""),
+          }
+
+          round_dir.mkdir(parents=True, exist_ok=True)
+          (round_dir / "counts.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+          text = (
+              f"round={round_name} target={CLASSNAME} evidence={verdict} "
+              f"mavenExitStatus={maven_status} failsafeXmlFiles={len(reports)} cases={len(cases)} "
+              f"executed={executed} skipped={skipped} failures={failures} errors={errors} "
+              f"expected={len(EXPECTED)} methodSetMatchesExactly={method_set_matches}\n"
+              f"executedMethods={','.join(sorted(names)) if names else '<none>'}\n"
+              f"missingMethods={','.join(missing) if missing else '<none>'} "
+              f"unexpectedMethods={','.join(unexpected) if unexpected else '<none>'} "
+              f"duplicateMethods={','.join(duplicates) if duplicates else '<none>'}\n"
+              f"problems={'; '.join(problems) if problems else '<none>'}\n"
+          )
+          (round_dir / "counts.txt").write_text(text)
+          print(text, end="")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a") as summary:
+                  summary.write(
+                      "Pinned-source repeated-run validation for issue #12959 "
+                      "(fork-only; does not update or adopt the PR Build check).\n\n"
+                  )
+                  summary.write("```\n" + text + "```\n")
+
+          sys.exit(0 if verdict == "PASSED" else 1)
+          PYGATE
+            gate_status=$?
+
+            if [ "${gate_status}" -eq 0 ]; then
+              round_verdict="PASSED"
+            else
+              round_verdict="FAILED"
+            fi
+            printf '%s\t%s\t%s\t%s\n' "${round}" "${maven_status}" "${gate_status}" "${round_verdict}" >> "${ROOT}/rounds.tsv"
+            completed=$((completed + 1))
+
+            if [ "${maven_status}" -ne 0 ] || [ "${gate_status}" -ne 0 ]; then
+              failed_round="${round}"
+              echo "::error::Validation round ${round}/${ROUNDS} did not pass (mavenExitStatus=${maven_status} gateStatus=${gate_status}). Stopping immediately: no later round may mask this, and consecutive passing runs are not established."
+              break
+            fi
+            echo "round=${round}/${ROUNDS} PASSED (mavenExitStatus=0 gateStatus=0)"
+          done
+
+          {
+            echo "roundsRequested=${ROUNDS}"
+            echo "roundsCompleted=${completed}"
+            echo "failedRound=${failed_round}"
+            echo "roundsGate=one tab-separated row per round: round, mavenExitStatus, gateStatus, verdict"
+            cat "${ROOT}/rounds.tsv"
+          } | tee "${ROOT}/rounds-summary.txt"
+
+          if [ "${failed_round}" -ne 0 ]; then
+            echo "::error::Repeated-run validation failed at round ${failed_round}."
+            exit 1
+          fi
+          if [ "${completed}" -ne "${ROUNDS}" ]; then
+            echo "::error::Only ${completed}/${ROUNDS} rounds completed; consecutive passing runs not established."
+            exit 1
+          fi
+          echo "ALL_ROUNDS_PASSED rounds=${ROUNDS}"
+
+      - name: Enforce three consecutive passing rounds
+        if: always()
+        shell: bash
+        run: |
+          # Defence in depth: never report green unless every round is recorded
+          # PASSED with mavenExitStatus=0 and gateStatus=0.
+          set -uo pipefail
+          ROOT="${RUNNER_TEMP}/mysql-validation"
+          rows="${ROOT}/rounds.tsv"
+          if [ ! -f "$rows" ]; then
+            echo "::error::No per-round results were recorded; consecutive passing runs not established."
+            exit 1
+          fi
+          passed=$(awk -F'\t' '$2 == 0 && $3 == 0 && $4 == "PASSED"' "$rows" | wc -l | tr -d ' ')
+          total=$(wc -l < "$rows" | tr -d ' ')
+          verdict="FAILED"
+          if [ "$passed" = "3" ] && [ "$total" = "3" ]; then
+            verdict="PASSED"
+          fi
+          {
+            echo "consecutiveRoundsRequested=3"
+            echo "roundsRecorded=${total}"
+            echo "roundsPassed=${passed}"
+            echo "consecutiveRunEvidence=${verdict}"
+          } | tee "${ROOT}/consecutive-runs.txt"
+          if [ "$verdict" != "PASSED" ]; then
+            echo "::error::Expected 3 consecutive passing rounds, found ${passed}/${total}."
+            exit 1
+          fi
+
+      - name: Upload per-round XML and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-stop-mode-validation-attempt${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/mysql-validation/**
+            **/target/failsafe-reports/*.xml
+            **/target/surefire-reports/*.xml
+          retention-days: 7
+          if-no-files-found: warn
