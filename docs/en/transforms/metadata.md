@@ -134,14 +134,14 @@ transform {
 
 |      name       | type | required | default value | description       |
 |:---------------:|------|:--------:|:-------------:|-------------------|
-| metadata_fields | map  |    yes    |       -       | Mapping relationship between metadata fields and output fields, format: `Metadata Key = output field name`. Must contain at least one entry. |
+| metadata_fields | map  | conditional |       -       | Mapping from metadata keys to output field names: `Metadata Key = output field name`. Required without per-table rules; each per-table entry requires a non-empty map. |
 | table_match_regex | string |    no    |     `.*`      | Regex of the table paths that the transform level rule applies to. |
-| table_transform | array |    no    |       -       | Per-table rules, see [Multi-Table Transform](transform-multi-table.md). |
+| table_transform | array |    no    | `[]` | Per-table rules, see [Multi-Table Transform](transform-multi-table.md). |
 | rule_match_mode | string |    no    | `FIRST_MATCH` | How multiple `table_transform` entries with the same `table_path` are evaluated. |
 
 ### metadata_fields [map]
 
-Defines the mapping relationship between metadata fields and output fields.
+Defines the mapping relationship between metadata fields and output fields. A non-empty map is required when `table_transform` is absent or empty, and in each per-table entry. With per-table rules, omit the transform-level map to leave unmatched tables unchanged.
 
 **Configuration Format:**
 ```hocon
@@ -169,6 +169,18 @@ metadata_fields {
 - The right side is a custom output field name, which cannot duplicate existing field names
 - You can select only the metadata fields you need, not all of them must be configured
 
+### table_match_regex [string]
+
+Regex of the table paths that the transform level rule applies to. The default `.*` matches every table.
+
+### table_transform [array]
+
+Per-table rules, see [Multi-Table Transform](transform-multi-table.md). Each entry must have a `table_path` and a non-empty `metadata_fields` map. Entries take precedence over the transform-level `metadata_fields` for tables whose exact `table_path` matches.
+
+### rule_match_mode [string]
+
+Controls repeated `table_path` entries. If omitted, the default is `FIRST_MATCH`, but duplicate paths are rejected. Explicit `FIRST_MATCH` keeps only the first matching entry; `ALL_MATCH` applies matching entries in configuration order, each receiving the previous entry's output.
+
 ### Knowledge Sync Projection Example
 
 Project Knowledge Sync logical metadata keys into canonical physical columns. The upstream producer must already provide the metadata values through row options and declare them in the table metadata schema.
@@ -190,6 +202,102 @@ transform {
 ```
 
 After this transform, downstream components can read `document_id`, `chunk_id`, and `chunk_hash` as regular physical fields in the input schema.
+
+## Multi-Table Configuration
+
+Metadata supports multi-table transform through the same common options described in [Multi-Table Transform](transform-multi-table.md).
+
+In multi-table mode, `table_transform` entries take precedence over the transform-level rule. A table matched by a `table_transform` entry uses that entry's `metadata_fields`. Tables not matched by any entry fall back to the transform-level rule if `table_match_regex` matches and transform-level `metadata_fields` is configured. If no rule applies, the table is passed through unchanged.
+
+If only `table_transform` entries are provided (no transform-level `metadata_fields`), the configuration is valid and all unmatched tables are passed through unchanged. Use this form to project metadata for only some tables.
+
+Examples below use FakeSource with two tables and Console sink to demonstrate both default and per-table override configurations.
+
+### Default Rule with Per-Table Override
+
+This example applies a default `RowKind` mapping to all tables, but overrides it for `fake.table2` to use a different output field name.
+
+```hocon
+env {
+  job.mode = "BATCH"
+  parallelism = 1
+}
+
+source {
+  FakeSource {
+    tables_configs = [
+      {
+        row.num = 1
+        schema = {
+          table = "fake.table1"
+          fields {
+            id = int
+          }
+        }
+      },
+      {
+        row.num = 1
+        schema = {
+          table = "fake.table2"
+          fields {
+            id = int
+          }
+        }
+      }
+    ]
+    plugin_output = "fake"
+  }
+}
+
+transform {
+  Metadata {
+    plugin_input = "fake"
+    plugin_output = "metadata"
+    metadata_fields = {
+      RowKind = "default_op"
+    }
+    table_transform = [
+      {
+        table_path = "fake.table2"
+        metadata_fields = {
+          RowKind = "special_op"
+        }
+      }
+    ]
+  }
+}
+
+sink {
+  Console {
+    plugin_input = "metadata"
+  }
+}
+```
+
+Expected output columns: `fake.table1` -> `id`, `default_op`; `fake.table2` -> `id`, `special_op`. Both get `+I` as the RowKind value for FakeSource INSERT rows.
+
+### Per-Table Rules Only
+
+To project metadata for only one table, replace the `transform` section of the job above with the following. Without transform-level `metadata_fields`, unmatched tables pass through unchanged:
+
+```hocon
+transform {
+  Metadata {
+    plugin_input = "fake"
+    plugin_output = "metadata"
+    table_transform = [
+      {
+        table_path = "fake.table1"
+        metadata_fields = {
+          RowKind = "op"
+        }
+      }
+    ]
+  }
+}
+```
+
+Expected output: `fake.table1` gets an additional `op` column; `fake.table2` remains unchanged with only `id`.
 
 ## Complete Examples
 

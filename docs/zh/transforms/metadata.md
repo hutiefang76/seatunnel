@@ -134,14 +134,14 @@ transform {
 
 |      参数名       | 类型 | 是否必填 | 默认值 | 说明       |
 |:---------------:|------|:--------:|:-------------:|-------------------|
-| metadata_fields | map  |    是     |   -   | 元数据字段与输出字段的映射关系，格式为 `元数据Key = 输出字段名`。至少需要配置一个映射项。 |
+| metadata_fields | map  | 按条件必填 |   -   | 元数据Key到输出字段名的映射，格式为 `元数据Key = 输出字段名`。没有单表规则时必填，每个单表条目需要非空映射。 |
 | table_match_regex | string |    否    |     `.*`      | 转换级别规则所适用的表路径的正则表达式。 |
-| table_transform | array |    否    |       -       | 针对单表的规则，参见 [多表转换](transform-multi-table.md)。 |
+| table_transform | array |    否    | `[]` | 针对单表的规则，参见 [多表转换](transform-multi-table.md)。 |
 | rule_match_mode | string |    否    | `FIRST_MATCH` | 当多个 `table_transform` 条目的 `table_path` 相同时，决定它们的匹配方式。 |
 
 ### metadata_fields [map]
 
-定义元数据字段到输出字段的映射关系。
+定义元数据字段到输出字段的映射关系。`table_transform` 缺省或为空时，以及每个单表条目中，都需要非空映射。配置单表规则时，省略转换级别的映射可使未匹配的表保持不变。
 
 **配置格式：**
 ```hocon
@@ -169,6 +169,18 @@ metadata_fields {
 - 右侧是自定义的输出字段名，不能与原有字段重名
 - 可以只选择需要的元数据字段，不必全部配置
 
+### table_match_regex [string]
+
+转换级别规则所适用的表路径的正则表达式。默认 `.*` 匹配所有表。
+
+### table_transform [array]
+
+针对单表的规则，参见 [多表转换](transform-multi-table.md)。每个条目必须包含 `table_path` 和非空的 `metadata_fields` 映射。对于 `table_path` 精确匹配的表，条目优先级高于转换级别的 `metadata_fields`。
+
+### rule_match_mode [string]
+
+控制重复的 `table_path` 条目。省略时默认值为 `FIRST_MATCH`，但会拒绝重复路径。显式设置 `FIRST_MATCH` 只使用第一个匹配条目；`ALL_MATCH` 按配置顺序应用全部匹配条目，后一个条目接收前一个条目的输出。
+
 ### Knowledge Sync 投影示例
 
 将 Knowledge Sync 逻辑元数据 Key 投影为标准物理列。上游 producer 必须已经通过行 options 提供这些元数据值，并在表 metadata schema 中声明这些字段。
@@ -190,6 +202,102 @@ transform {
 ```
 
 完成该转换后，下游组件可以把 `document_id`、`chunk_id`、`chunk_hash` 当作输入 schema 中的普通物理字段读取。
+
+## 多表配置
+
+Metadata 通过 [多表转换](transform-multi-table.md) 中描述的通用选项支持多表转换。
+
+在多表模式下，`table_transform` 条目的优先级高于转换级别规则。匹配 `table_transform` 条目的表使用该条目的 `metadata_fields`。未匹配任何条目的表，如果 `table_match_regex` 匹配且配置了转换级别的 `metadata_fields`，则回退到转换级别规则。如果没有规则适用，则表原样传递。
+
+如果只配置了 `table_transform` 条目（没有转换级别的 `metadata_fields`），配置同样有效，所有未匹配的表将原样传递。这是仅为部分表投影元数据的推荐方式。
+
+下面的示例使用 FakeSource 两张表和控制台接收器，演示默认配置和单表覆盖配置。
+
+### 默认规则与单表覆盖
+
+此示例对所有表应用默认的 `RowKind` 映射，但对 `fake.table2` 覆盖为不同的输出字段名。
+
+```hocon
+env {
+  job.mode = "BATCH"
+  parallelism = 1
+}
+
+source {
+  FakeSource {
+    tables_configs = [
+      {
+        row.num = 1
+        schema = {
+          table = "fake.table1"
+          fields {
+            id = int
+          }
+        }
+      },
+      {
+        row.num = 1
+        schema = {
+          table = "fake.table2"
+          fields {
+            id = int
+          }
+        }
+      }
+    ]
+    plugin_output = "fake"
+  }
+}
+
+transform {
+  Metadata {
+    plugin_input = "fake"
+    plugin_output = "metadata"
+    metadata_fields = {
+      RowKind = "default_op"
+    }
+    table_transform = [
+      {
+        table_path = "fake.table2"
+        metadata_fields = {
+          RowKind = "special_op"
+        }
+      }
+    ]
+  }
+}
+
+sink {
+  Console {
+    plugin_input = "metadata"
+  }
+}
+```
+
+预期输出列：`fake.table1` -> `id`、`default_op`；`fake.table2` -> `id`、`special_op`。对于 FakeSource 的 INSERT 行，两者都得到 `+I` 作为 RowKind 值。
+
+### 仅配置单表规则
+
+若只为一张表投影元数据，将上方作业的 `transform` 部分替换为以下配置。没有转换级别的 `metadata_fields` 时，未匹配的表保持不变：
+
+```hocon
+transform {
+  Metadata {
+    plugin_input = "fake"
+    plugin_output = "metadata"
+    table_transform = [
+      {
+        table_path = "fake.table1"
+        metadata_fields = {
+          RowKind = "op"
+        }
+      }
+    ]
+  }
+}
+```
+
+预期输出：`fake.table1` 增加一个 `op` 列；`fake.table2` 保持不变，只有 `id` 列。
 
 ## 完整示例
 
