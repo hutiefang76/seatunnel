@@ -169,6 +169,24 @@ public class HiveSinkAggregatedCommitter extends FileSinkAggregatedCommitter {
             return false;
         }
 
+        // A missing source with its exact target present is an already-published move.
+        // Inspect the whole batch before cleaning any directory, including on checkpoint replay.
+        for (FileAggregatedCommitInfo info : aggregatedCommitInfos) {
+            for (Map<String, String> moves : info.getTransactionMap().values()) {
+                for (Map.Entry<String, String> move : moves.entrySet()) {
+                    if (!hadoopFileSystemProxy.fileExist(move.getKey())
+                            && hadoopFileSystemProxy.fileExist(move.getValue())) {
+                        String target = move.getValue().replace('\\', '/');
+                        int separator = target.lastIndexOf('/');
+                        if (separator > 0) {
+                            deletedTargetDirectories.add(
+                                    normalizeDirectoryPath(target.substring(0, separator)));
+                        }
+                    }
+                }
+            }
+        }
+
         boolean anyDeleted = false;
 
         for (FileAggregatedCommitInfo aggregatedCommitInfo : aggregatedCommitInfos) {
@@ -253,11 +271,12 @@ public class HiveSinkAggregatedCommitter extends FileSinkAggregatedCommitter {
             return false;
         }
 
-        if (!deletedTargetDirectories.add(normalized)) {
+        if (deletedTargetDirectories.contains(normalized)) {
             return false;
         }
 
         hadoopFileSystemProxy.deleteFile(directory);
+        deletedTargetDirectories.add(normalized);
         return true;
     }
 

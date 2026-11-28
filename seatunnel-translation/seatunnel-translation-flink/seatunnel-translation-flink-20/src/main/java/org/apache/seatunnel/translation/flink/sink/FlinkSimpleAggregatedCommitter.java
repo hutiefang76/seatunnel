@@ -41,7 +41,7 @@ public class FlinkSimpleAggregatedCommitter<CommT, GlobalCommT>
 
     private final SinkAggregatedCommitter<CommT, GlobalCommT> aggregatedCommitter;
     private MultiTableResourceManager<Object> resourceManager;
-    private final OptionalLong restoredCheckpointId;
+    private OptionalLong restoredCheckpointId;
 
     public FlinkSimpleAggregatedCommitter(
             SinkAggregatedCommitter<CommT, GlobalCommT> aggregatedCommitter) {
@@ -67,6 +67,10 @@ public class FlinkSimpleAggregatedCommitter<CommT, GlobalCommT>
         } catch (Exception e) {
             throw new RuntimeException("Failed to initialize aggregated committer", e);
         }
+    }
+
+    void setRestoredCheckpointId(OptionalLong restoredCheckpointId) {
+        this.restoredCheckpointId = restoredCheckpointId;
     }
 
     @Override

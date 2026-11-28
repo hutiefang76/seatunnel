@@ -49,19 +49,13 @@ class FlinkSimpleAggregatedCommitterTest {
     @Test
     void testLegacyRestoredCommittableUsesRecoveryCommit() throws Exception {
         SinkAggregatedCommitter<String, String> delegate = mock(SinkAggregatedCommitter.class);
-        SeaTunnelSink sink = mock(SeaTunnelSink.class);
-        when(sink.createAggregatedCommitter()).thenReturn(Optional.of(delegate));
-        when(sink.createCommitter()).thenReturn(Optional.empty());
         when(delegate.combine(Collections.singletonList("prepared"))).thenReturn("batch");
-        CommitterInitContext context = mock(CommitterInitContext.class);
-        when(context.getRestoredCheckpointId()).thenReturn(OptionalLong.of(8));
         Committer.CommitRequest<CommitWrapper<String>> request =
                 mock(Committer.CommitRequest.class);
         when(request.getCommittable()).thenReturn(new CommitWrapper<>("prepared"));
 
-        Committer<CommitWrapper<String>> committer =
-                new FlinkSink<String, String, String>(sink, Collections.emptyList(), 1)
-                        .createCommitter(context);
+        FlinkSimpleAggregatedCommitter<String, String> committer =
+                new FlinkSimpleAggregatedCommitter<>(delegate, OptionalLong.of(8));
         committer.commit(Collections.singletonList(request));
 
         verify(delegate).restoreCommit(Collections.singletonList("batch"));
@@ -137,6 +131,63 @@ class FlinkSimpleAggregatedCommitterTest {
                 mock(Committer.CommitRequest.class);
         when(request.getCommittable()).thenReturn(new CheckpointCommitWrapper<>(value, checkpoint));
         return request;
+    }
+
+    @Test
+    void testAggregatedSinkCreatesNoOpLocalCommitter() throws Exception {
+        SinkAggregatedCommitter<String, String> delegate = mock(SinkAggregatedCommitter.class);
+        SeaTunnelSink sink = mock(SeaTunnelSink.class);
+        when(sink.createAggregatedCommitter()).thenReturn(Optional.of(delegate));
+        when(sink.createCommitter()).thenReturn(Optional.empty());
+        CommitterInitContext context = mock(CommitterInitContext.class);
+        when(context.getRestoredCheckpointId()).thenReturn(OptionalLong.empty());
+        Committer<CommitWrapper<String>> committer =
+                new FlinkSink<String, String, String>(sink, Collections.emptyList(), 1)
+                        .createCommitter(context);
+
+        // Verify no-op behavior by signaling already committed on a dummy request
+        Committer.CommitRequest<CommitWrapper<String>> request =
+                mock(Committer.CommitRequest.class);
+        when(request.getCommittable()).thenReturn(new CommitWrapper<>("dummy"));
+        committer.commit(Collections.singletonList(request));
+        verify(request).signalAlreadyCommitted();
+        verify(delegate, never()).commit(anyList());
+        verify(delegate, never()).init();
+        committer.close();
+    }
+
+    @Test
+    void testAggregatedSinkUsesOneGlobalCommitterWithParallelWriters() throws Exception {
+        SinkAggregatedCommitter<String, String> delegate = mock(SinkAggregatedCommitter.class);
+        SeaTunnelSink sink = mock(SeaTunnelSink.class);
+        when(sink.createAggregatedCommitter()).thenReturn(Optional.of(delegate));
+        when(sink.createCommitter()).thenReturn(Optional.empty());
+        when(sink.getCommitInfoSerializer())
+                .thenReturn(
+                        Optional.of(
+                                new org.apache.seatunnel.api.serialization.DefaultSerializer<>()));
+        org.apache.flink.streaming.api.environment.StreamExecutionEnvironment env =
+                org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
+                        .getExecutionEnvironment();
+        env.setParallelism(2);
+        env.fromElements(new org.apache.seatunnel.api.table.type.SeaTunnelRow(new Object[] {1}))
+                .sinkTo(new FlinkSink<String, String, String>(sink, Collections.emptyList(), 2))
+                .setParallelism(2);
+        java.util.Collection<org.apache.flink.streaming.api.graph.StreamNode> nodes =
+                env.getStreamGraph().getStreamNodes();
+        org.apache.flink.streaming.api.graph.StreamNode global =
+                nodes.stream()
+                        .filter(node -> node.getOperatorName().contains("Global Committer"))
+                        .findFirst()
+                        .orElseThrow(
+                                () -> new AssertionError("Missing global aggregated committer"));
+        Assertions.assertEquals(1, global.getParallelism());
+        Assertions.assertTrue(
+                nodes.stream()
+                        .anyMatch(
+                                node ->
+                                        node.getOperatorName().contains("Writer")
+                                                && node.getParallelism() == 2));
     }
 
     @Test

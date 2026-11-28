@@ -19,6 +19,8 @@ package org.apache.seatunnel.translation.flink.sink;
 
 import org.apache.seatunnel.api.serialization.Serializer;
 import org.apache.seatunnel.api.sink.SeaTunnelSink;
+import org.apache.seatunnel.api.sink.SinkAggregatedCommitter;
+import org.apache.seatunnel.api.sink.SinkCommitter;
 import org.apache.seatunnel.api.sink.SupportSchemaEvolutionSink;
 import org.apache.seatunnel.api.table.catalog.CatalogTable;
 import org.apache.seatunnel.api.table.schema.SchemaChangeType;
@@ -26,6 +28,7 @@ import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.translation.flink.serialization.EmptyFlinkWriterStateSerializer;
 import org.apache.seatunnel.translation.flink.serialization.FlinkWriterStateSerializer;
 
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.connector.sink2.Committer;
 import org.apache.flink.api.connector.sink2.CommitterInitContext;
 import org.apache.flink.api.connector.sink2.Sink;
@@ -35,16 +38,22 @@ import org.apache.flink.api.connector.sink2.SupportsCommitter;
 import org.apache.flink.api.connector.sink2.SupportsWriterState;
 import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
+import org.apache.flink.streaming.api.connector.sink2.CommittableMessage;
+import org.apache.flink.streaming.api.connector.sink2.SupportsPostCommitTopology;
+import org.apache.flink.streaming.api.datastream.DataStream;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class FlinkSink<CommT, WriterStateT, GlobalCommT>
         implements Sink<SeaTunnelRow>,
                 SupportsCommitter<CommitWrapper<CommT>>,
+                SupportsPostCommitTopology<CommitWrapper<CommT>>,
                 SupportsWriterState<SeaTunnelRow, FlinkWriterState<WriterStateT>> {
 
     private final SeaTunnelSink<SeaTunnelRow, WriterStateT, CommT, GlobalCommT> seaTunnelSink;
@@ -88,21 +97,54 @@ public class FlinkSink<CommT, WriterStateT, GlobalCommT>
     @Override
     public Committer<CommitWrapper<CommT>> createCommitter(CommitterInitContext context)
             throws IOException {
-        // Try to create SinkCommitter first
-        if (seaTunnelSink.createCommitter().isPresent()) {
+        Optional<SinkCommitter<CommT>> local = seaTunnelSink.createCommitter();
+        if (local.isPresent()) {
+            return new FlinkCommitter<>(local.get());
+        }
+        return seaTunnelSink.createAggregatedCommitter().isPresent() ? new NoOpCommitter<>() : null;
+    }
+
+    @Override
+    public void addPostCommitTopology(
+            DataStream<CommittableMessage<CommitWrapper<CommT>>> committables) {
+        try {
+            if (seaTunnelSink.createCommitter().isPresent()
+                    || !seaTunnelSink.createAggregatedCommitter().isPresent()) {
+                return;
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot create aggregated committer topology", e);
+        }
+        committables
+                .global()
+                .transform(
+                        "Global Committer",
+                        Types.VOID,
+                        new FlinkGlobalAggregatedCommitterOperator<CommT, GlobalCommT>(
+                                this::createGlobalAggregatedCommitter,
+                                this::getCommittableSerializer))
+                .setParallelism(1);
+    }
+
+    private SinkAggregatedCommitter<CommT, GlobalCommT> createGlobalAggregatedCommitter() {
+        try {
             return seaTunnelSink
-                    .createCommitter()
-                    .<Committer<CommitWrapper<CommT>>>map(FlinkCommitter::new)
-                    .orElse(null);
+                    .createAggregatedCommitter()
+                    .orElseThrow(() -> new IllegalStateException("Missing aggregated committer"));
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot create aggregated committer", e);
+        }
+    }
+
+    private static class NoOpCommitter<C> implements Committer<CommitWrapper<C>> {
+        @Override
+        public void commit(Collection<CommitRequest<CommitWrapper<C>>> requests) {
+            // Flink forwards these committables to the checkpointed global operator.
+            requests.forEach(CommitRequest::signalAlreadyCommitted);
         }
 
-        if (seaTunnelSink.createAggregatedCommitter().isPresent()) {
-            return new FlinkSimpleAggregatedCommitter<>(
-                    seaTunnelSink.createAggregatedCommitter().get(),
-                    context.getRestoredCheckpointId());
-        }
-
-        return null;
+        @Override
+        public void close() {}
     }
 
     @Override

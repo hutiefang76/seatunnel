@@ -29,12 +29,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.Mockito;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -43,7 +45,8 @@ import java.util.stream.Stream;
 
 class HiveSinkAggregatedCommitterOverwriteStreamingTest {
 
-    private static class TestableCommitter extends HiveSinkAggregatedCommitter {
+    private static class TestableCommitter extends HiveSinkAggregatedCommitter
+            implements AutoCloseable {
         TestableCommitter(
                 ReadonlyConfig cfg, String dbName, String tableName, HadoopConf hadoopConf) {
             super(cfg, dbName, tableName, hadoopConf);
@@ -325,5 +328,119 @@ class HiveSinkAggregatedCommitterOverwriteStreamingTest {
         Field f = HiveSinkAggregatedCommitter.class.getDeclaredField("hiveMetaStore");
         f.setAccessible(true);
         f.set(committer, hiveMetaStore);
+    }
+
+    @Test
+    void shouldPreservePartiallyPublishedCheckpointOnRestore(@TempDir Path tempDir)
+            throws Exception {
+        for (boolean partitioned : new boolean[] {false, true}) {
+            Path root = tempDir.resolve(Boolean.toString(partitioned));
+            Path target = root.resolve(partitioned ? "warehouse/pt=1" : "warehouse");
+            Files.createDirectories(target);
+            Files.write(target.resolve("old"), "OLD".getBytes(StandardCharsets.UTF_8));
+            FileAggregatedCommitInfo a = stagedInfo(root, target, 0, "A", partitioned);
+            FileAggregatedCommitInfo b = stagedInfo(root, target, 1, "B", partitioned);
+            try (TestableCommitter committer = localCommitter(localFileSystem())) {
+                Assertions.assertTrue(committer.commit(Collections.singletonList(a)).isEmpty());
+            }
+            Assertions.assertFalse(Files.exists(target.resolve("old")));
+            Assertions.assertEquals("A", Files.readString(target.resolve("A")));
+            Assertions.assertTrue(Files.exists(root.resolve("staging/T_job_1_1/B")));
+
+            // The unpublished transaction comes first so recovery must inspect the whole batch.
+            try (TestableCommitter committer = localCommitter(localFileSystem())) {
+                Assertions.assertTrue(committer.restoreCommit(Arrays.asList(b, a)).isEmpty());
+            }
+            Assertions.assertEquals("A", Files.readString(target.resolve("A")));
+            Assertions.assertEquals("B", Files.readString(target.resolve("B")));
+            try (Stream<Path> files = Files.list(target)) {
+                Assertions.assertEquals(2, files.count());
+            }
+            Assertions.assertFalse(Files.exists(root.resolve("staging/T_job_0_1/A")));
+            Assertions.assertFalse(Files.exists(root.resolve("staging/T_job_1_1/B")));
+        }
+    }
+
+    @Test
+    void shouldRetryFailedTargetCleanup(@TempDir Path tempDir) throws Exception {
+        Path target = tempDir.resolve("warehouse");
+        Files.createDirectories(target);
+        Files.writeString(target.resolve("old"), "OLD");
+        FileAggregatedCommitInfo info = stagedInfo(tempDir, target, 0, "A", false);
+        HadoopFileSystemProxy proxy = Mockito.spy(localFileSystem());
+        Mockito.doThrow(new IOException("target cleanup failed"))
+                .doCallRealMethod()
+                .when(proxy)
+                .deleteFile(target.toString());
+        try (TestableCommitter committer = localCommitter(proxy)) {
+            Assertions.assertThrows(
+                    IOException.class, () -> committer.commit(Collections.singletonList(info)));
+            Assertions.assertEquals("OLD", Files.readString(target.resolve("old")));
+            Assertions.assertTrue(Files.exists(tempDir.resolve("staging/T_job_0_1/A")));
+            Assertions.assertTrue(committer.commit(Collections.singletonList(info)).isEmpty());
+            Assertions.assertFalse(Files.exists(target.resolve("old")));
+            Assertions.assertEquals("A", Files.readString(target.resolve("A")));
+            Mockito.verify(proxy, Mockito.times(2)).deleteFile(target.toString());
+        }
+    }
+
+    private static HadoopFileSystemProxy localFileSystem() {
+        HadoopConf conf = new HadoopConf("file:///");
+        LinkedHashMap<String, String> options = new LinkedHashMap<>();
+        options.put("fs.file.impl.disable.cache", "true");
+        conf.setExtraOptions(options);
+        return new HadoopFileSystemProxy(conf);
+    }
+
+    @Test
+    void shouldRestoreAfterOneFileMoveFails(@TempDir Path tempDir) throws Exception {
+        Path target = tempDir.resolve("warehouse");
+        Files.createDirectories(target);
+        Files.writeString(target.resolve("old"), "OLD");
+        FileAggregatedCommitInfo a = stagedInfo(tempDir, target, 0, "A", false);
+        FileAggregatedCommitInfo b = stagedInfo(tempDir, target, 1, "B", false);
+        HadoopFileSystemProxy proxy = Mockito.spy(localFileSystem());
+        Mockito.doThrow(new IOException("file move failed"))
+                .when(proxy)
+                .renameFile(
+                        tempDir.resolve("staging/T_job_1_1/B").toString(),
+                        target.resolve("B").toString(),
+                        true);
+        try (TestableCommitter committer = localCommitter(proxy)) {
+            Assertions.assertEquals(
+                    Collections.singletonList(b), committer.commit(Arrays.asList(a, b)));
+            Assertions.assertEquals("A", Files.readString(target.resolve("A")));
+            Assertions.assertTrue(Files.exists(tempDir.resolve("staging/T_job_1_1/B")));
+        }
+        try (TestableCommitter committer = localCommitter(localFileSystem())) {
+            Assertions.assertTrue(committer.restoreCommit(Arrays.asList(b, a)).isEmpty());
+        }
+        Assertions.assertEquals("A", Files.readString(target.resolve("A")));
+        Assertions.assertEquals("B", Files.readString(target.resolve("B")));
+        Assertions.assertFalse(Files.exists(target.resolve("old")));
+    }
+
+    private static TestableCommitter localCommitter(HadoopFileSystemProxy proxy) throws Exception {
+        TestableCommitter committer =
+                new TestableCommitter(
+                        minimalHiveReadonlyConfig(true), "db", "tbl", new HadoopConf("file:///"));
+        committer.setFileSystemProxy(proxy);
+        setHiveMetaStore(committer, Mockito.mock(HiveMetaStoreCatalog.class));
+        return committer;
+    }
+
+    private static FileAggregatedCommitInfo stagedInfo(
+            Path root, Path target, int writer, String value, boolean partitioned)
+            throws Exception {
+        Path transaction = root.resolve("staging/T_job_" + writer + "_1");
+        Path source = transaction.resolve(value);
+        Files.createDirectories(transaction);
+        Files.writeString(source, value);
+        return aggregatedCommitInfo(
+                transaction.toString(),
+                Collections.singletonMap(source.toString(), target.resolve(value).toString()),
+                partitioned
+                        ? Collections.singletonMap("pt=1", Collections.singletonList("1"))
+                        : Collections.emptyMap());
     }
 }

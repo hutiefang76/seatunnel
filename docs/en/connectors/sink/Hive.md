@@ -166,6 +166,8 @@ Flag to decide whether to use overwrite mode when inserting data into Hive. If s
 - Batch mode (BATCH): Delete existing data in the target path before commit (for non-partitioned tables, delete the table directory; for partitioned tables, delete the related partition directories), then write new data.
 - Streaming mode (STREAMING): In streaming jobs with checkpointing enabled, `commit()` is invoked after each completed checkpoint. To avoid deleting on every checkpoint (which would wipe previously committed files), SeaTunnel deletes each target directory (table directory / partition directory) at most once (empty commits will skip deletion). On recovery, the delete step is best-effort and may be skipped to avoid deleting already committed data, so streaming overwrite is not a strict snapshot overwrite.
 
+For Flink 1.20, batch writers may run in parallel while a single global committer coordinates overwrite cleanup and publication. Replaying a partially committed batch preserves files that have already reached the target directory and completes the remaining moves. This applies to both partitioned and non-partitioned tables.
+
 ### data_save_mode [enum]
 
 Select how to handle existing data on the target before writing new data.
